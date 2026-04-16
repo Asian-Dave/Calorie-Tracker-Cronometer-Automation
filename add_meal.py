@@ -115,6 +115,7 @@ async def cronometer_add(
         ctx  = await browser.new_context(**ctx_kwargs)
         page = await ctx.new_page()
 
+
         async def shot(name: str) -> None:
             p = BASE_DIR / f"debug_{name}.png"
             await page.screenshot(path=str(p), full_page=True)
@@ -150,18 +151,24 @@ async def _login(page: Page, username: str, password: str, ctx=None) -> None:
     resp = await page.goto(f"{CRONOMETER_URL}/login/", wait_until="domcontentloaded", timeout=60_000)
     print(f"  HTTP {resp.status if resp else '?'}", flush=True)
 
-    # Wait for either the GWT app sidebar (session valid) or the login form
+    # Give the page up to 20s to show either the GWT app or the login form
     try:
         await page.wait_for_selector(
             'a.btn-sidebar:has-text("Diary"), input#username',
-            state="visible", timeout=25_000
+            state="visible", timeout=20_000
         )
     except PWTimeout:
-        raise RuntimeError(f"Timed out waiting for app or login form at {page.url}")
+        pass  # Neither appeared — fall through to login attempt anyway
 
-    if await page.locator('a.btn-sidebar:has-text("Diary")').count() > 0:
+    if await page.locator('a.btn-sidebar:has-text("Diary")').is_visible():
         print("  Session still valid — skipping login.", flush=True)
         return
+
+    # If we landed on the Webflow marketing homepage (session cookies don't load the app
+    # when navigating directly), go to the login page explicitly
+    if "/login" not in page.url:
+        await page.goto(f"{CRONOMETER_URL}/login/", wait_until="domcontentloaded", timeout=30_000)
+        await page.locator("input#username").wait_for(state="visible", timeout=15_000)
 
     # Need to log in
     await page.locator("input#username").fill(username)
@@ -195,17 +202,16 @@ async def _login(page: Page, username: str, password: str, ctx=None) -> None:
 
 
 async def _dismiss_popups(page: Page) -> None:
-    """Permanently remove cookie/privacy overlays from DOM so they never intercept clicks."""
+    """Remove the cookie consent overlay. Never touches GWT's own popup panels."""
     removed = await page.evaluate("""() => {
         const removed = [];
-        // Click Accept first (records consent so it doesn't reappear on next page load)
+        // Click Accept to record consent server-side so it stops appearing
         const accept = Array.from(document.querySelectorAll('button'))
             .find(b => ['accept','accept all','i accept'].includes(b.innerText?.trim().toLowerCase()));
         if (accept) { accept.click(); removed.push('accepted:' + accept.innerText.trim()); }
-        // Then nuke the overlay nodes entirely
-        ['#ncmp__tool', '.gwt-PopupPanelGlass', '.pretty-dialog', '.popupContent'].forEach(sel => {
-            document.querySelectorAll(sel).forEach(el => { el.remove(); removed.push('removed:' + sel); });
-        });
+        // Only remove the ncmp consent overlay — never GWT's own popup panels
+        const ncmp = document.getElementById('ncmp__tool');
+        if (ncmp) { ncmp.remove(); removed.push('removed:#ncmp__tool'); }
         return removed;
     }""")
     if removed:
@@ -228,11 +234,15 @@ async def _navigate_diary(page: Page, log_date: str) -> None:
 
 
 async def _open_food_dialog(page: Page) -> None:
-    """Open the 'Add Food to Diary' dialog — removes overlays first, then proper click."""
+    """Open the 'Add Food to Diary' dialog."""
     await _dismiss_popups(page)
-    food_btn = page.locator('button.button-panel-btn').first
-    await food_btn.wait_for(state="visible", timeout=8_000)
-    await food_btn.click()
+    # Click the FOOD button via JS — targets the first visible one regardless of which
+    # panel it lives in (main bar vs hidden sidebar duplicate)
+    await page.evaluate("""() => {
+        const btn = Array.from(document.querySelectorAll('button.button-panel-btn'))
+            .find(b => b.offsetParent !== null && b.innerText.trim() === 'FOOD');
+        if (btn) btn.click();
+    }""")
     await page.locator('input[placeholder="Search all foods & recipes..."]').first.wait_for(
         state="visible", timeout=8_000
     )
