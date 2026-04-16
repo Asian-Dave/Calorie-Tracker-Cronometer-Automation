@@ -1,14 +1,15 @@
 services:
   calorie-tracker:
     build: .
-    # stdin_open so the container can receive piped JSON from add_meal.sh
     stdin_open: true
     tty: true
-    # Chromium needs more than Docker's default 64MB shared memory to render pages
     shm_size: "256m"
     environment:
       - PYTHONUNBUFFERED=1
+      # Credentials are injected at runtime by add_meal.sh from the host keychain.
+      # Never stored in the image or committed to the repo.
+      - CRONOMETER_USER
+      - CRONOMETER_PASSWORD
     volumes:
-      # Mount the whole project so screenshots and logs written inside
-      # the container at /app/ are immediately visible on the host.
+      # Mount the project so the script and session cache are shared with the host.
       - .:/app

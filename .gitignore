@@ -1,6 +1,8 @@
 auth.json
 config.json
 .session.json
+.env
+.crono_user
 debug_*.png
 debug_*.html
 probe.py

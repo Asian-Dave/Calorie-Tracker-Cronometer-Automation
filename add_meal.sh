@@ -15,6 +15,55 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config.json"
 
+# ── Load credentials (keychain → secret-service → .env → auth.json) ──────────
+_load_credentials() {
+    # 1. macOS Keychain
+    if [[ "$(uname -s)" == "Darwin" ]] && command -v security &>/dev/null; then
+        local pass
+        pass=$(security find-internet-password -s "cronometer.com" -w 2>/dev/null || true)
+        if [[ -n "$pass" ]]; then
+            CRONOMETER_USER=$(security find-internet-password -s "cronometer.com" -g 2>&1 | \
+                grep '"acct"' | sed 's/.*<blob>="//;s/"$//')
+            CRONOMETER_PASSWORD="$pass"
+            return
+        fi
+    fi
+
+    # 2. Linux Secret Service (GNOME Keyring / KWallet)
+    if command -v secret-tool &>/dev/null; then
+        local pass
+        pass=$(secret-tool lookup service "cronometer.com" username "$(cat "$SCRIPT_DIR/.crono_user" 2>/dev/null)" 2>/dev/null || true)
+        if [[ -n "$pass" ]]; then
+            CRONOMETER_USER=$(cat "$SCRIPT_DIR/.crono_user")
+            CRONOMETER_PASSWORD="$pass"
+            return
+        fi
+    fi
+
+    # 3. .env file (headless Linux / Raspberry Pi)
+    if [[ -f "$SCRIPT_DIR/.env" ]]; then
+        # shellcheck disable=SC1091
+        source "$SCRIPT_DIR/.env"
+        if [[ -n "${CRONOMETER_USER:-}" && -n "${CRONOMETER_PASSWORD:-}" ]]; then
+            return
+        fi
+    fi
+
+    # 4. Legacy auth.json fallback
+    if [[ -f "$SCRIPT_DIR/auth.json" ]]; then
+        CRONOMETER_USER=$(python3 -c "import json; d=json.load(open('$SCRIPT_DIR/auth.json')); print(d['http-basic']['https://cronometer.com']['username'])")
+        CRONOMETER_PASSWORD=$(python3 -c "import json; d=json.load(open('$SCRIPT_DIR/auth.json')); print(d['http-basic']['https://cronometer.com']['password'])")
+        return
+    fi
+
+    echo "Error: no credentials found. Run ./setup.sh first." >&2
+    exit 1
+}
+
+_load_credentials
+export CRONOMETER_USER
+export CRONOMETER_PASSWORD
+
 # ── Load defaults from config.json (if present) ────────────────────────────────
 _cfg() {
     # Usage: _cfg <key> <fallback>
@@ -136,4 +185,7 @@ echo ""
 DOCKER_FLAGS="--nutrition-from-stdin --date $LOG_DATE --meal $MEAL"
 [[ "$DEBUG"   == "true" ]] && DOCKER_FLAGS="$DOCKER_FLAGS --debug"
 
-docker compose run --rm -T calorie-tracker $DOCKER_FLAGS < "$TMPJSON"
+docker compose run --rm -T \
+    -e CRONOMETER_USER="$CRONOMETER_USER" \
+    -e CRONOMETER_PASSWORD="$CRONOMETER_PASSWORD" \
+    calorie-tracker $DOCKER_FLAGS < "$TMPJSON"

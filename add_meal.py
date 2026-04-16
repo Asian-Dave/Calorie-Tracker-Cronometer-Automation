@@ -30,6 +30,13 @@ CRONOMETER_URL = "https://cronometer.com"
 # ── Credentials ────────────────────────────────────────────────────────────────
 
 def load_credentials() -> tuple[str, str]:
+    """Load credentials from env vars (preferred) or auth.json fallback."""
+    import os
+    user = os.environ.get("CRONOMETER_USER")
+    password = os.environ.get("CRONOMETER_PASSWORD")
+    if user and password:
+        return user, password
+    # Fallback to auth.json for backwards compatibility
     with open(AUTH_FILE) as f:
         data = json.load(f)
     creds = data["http-basic"][CRONOMETER_URL]
@@ -169,31 +176,127 @@ async def cronometer_add(
             await browser.close()
 
 
-async def _login(page: Page, username: str, password: str, ctx=None) -> None:
-    print("Logging in…", flush=True)
-    resp = await page.goto(f"{CRONOMETER_URL}/login/", wait_until="domcontentloaded", timeout=60_000)
-    print(f"  HTTP {resp.status if resp else '?'}", flush=True)
+def _http_login(username: str, password: str) -> dict:
+    """
+    Authenticate with Cronometer via direct HTTP (no browser needed).
+    Returns a dict of cookies to inject into the Playwright context.
 
-    # Give the page up to 20s to show either the GWT app or the login form
+    Flow (same as crono by milldr):
+      1. GET  /login/         → extract anticsrf token + AWSALB cookies
+      2. POST /login          → submit credentials → receive JSESSIONID + sesnonce
+    """
+    import urllib.request
+    import urllib.parse
+    import http.cookiejar
+    import ssl
+
+    print("Authenticating via HTTP…", flush=True)
+    ctx = ssl.create_default_context()
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ctx),
+        urllib.request.HTTPCookieProcessor(jar),
+    )
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,*/*",
+        "Accept-Encoding": "identity",
+    }
+
+    # Step 1: GET login page — collect cookies + anticsrf token
+    req = urllib.request.Request(f"{CRONOMETER_URL}/login/", headers=headers)
+    with opener.open(req, timeout=15) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+
+    m = re.search(r'name="anticsrf"\s+value="([^"]+)"', html)
+    if not m:
+        raise RuntimeError(
+            "Could not extract anticsrf token from login page. "
+            "Cronometer may have changed their login form."
+        )
+    anticsrf = m.group(1)
+
+    # Step 2: POST credentials
+    payload = urllib.parse.urlencode({
+        "username": username,
+        "password": password,
+        "anticsrf": anticsrf,
+    }).encode("utf-8")
+    post_headers = {
+        **headers,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Referer": f"{CRONOMETER_URL}/login/",
+    }
+    req2 = urllib.request.Request(
+        f"{CRONOMETER_URL}/login", data=payload, headers=post_headers
+    )
+    with opener.open(req2, timeout=15) as resp:
+        final_url = resp.url
+
+    # Verify we're authenticated
+    cookie_names = {c.name for c in jar}
+    if "sesnonce" not in cookie_names and "JSESSIONID" not in cookie_names:
+        raise RuntimeError(
+            "Login failed — no session cookie received. "
+            "Check your credentials in auth.json or re-run ./setup.sh."
+        )
+
+    # Convert cookiejar → Playwright storage_state format
+    cookies = []
+    for c in jar:
+        cookies.append({
+            "name":     c.name,
+            "value":    c.value,
+            "domain":   c.domain.lstrip("."),
+            "path":     c.path or "/",
+            "httpOnly": bool(c.has_nonstandard_attr("HttpOnly")),
+            "secure":   bool(c.secure),
+            "sameSite": "Lax",
+        })
+
+    print(f"  Authenticated (cookies: {', '.join(c['name'] for c in cookies)})", flush=True)
+    return {"cookies": cookies, "origins": []}
+
+
+async def _login(page: Page, username: str, password: str, ctx=None) -> None:
+    """Inject HTTP-acquired cookies into the browser, then verify the app loads."""
+
+    # Attempt HTTP login first (fast, no rate-limit risk)
+    try:
+        storage_state = _http_login(username, password)
+        if ctx:
+            await ctx.add_cookies(storage_state["cookies"])
+            # Persist for next run
+            SESSION_FILE.write_text(json.dumps(storage_state))
+    except Exception as exc:
+        print(f"  HTTP login failed ({exc}), falling back to browser login…", flush=True)
+        storage_state = None
+
+    # Navigate to the app — with cookies injected it should load directly
+    await page.goto(f"{CRONOMETER_URL}/login/", wait_until="domcontentloaded", timeout=30_000)
+
+    # Wait for GWT app or login form
     try:
         await page.wait_for_selector(
             'a.btn-sidebar:has-text("Diary"), input#username',
-            state="visible", timeout=20_000
+            state="visible", timeout=25_000,
         )
     except PWTimeout:
-        pass  # Neither appeared — fall through to login attempt anyway
+        raise RuntimeError(f"Timed out waiting for Cronometer app at {page.url}")
 
     if await page.locator('a.btn-sidebar:has-text("Diary")').is_visible():
-        print("  Session still valid — skipping login.", flush=True)
+        print("  App loaded.", flush=True)
         return
 
-    # If we landed on the Webflow marketing homepage (session cookies don't load the app
-    # when navigating directly), go to the login page explicitly
+    # HTTP cookies weren't enough — browser login fallback
+    print("  Cookies not accepted, logging in via browser…", flush=True)
     if "/login" not in page.url:
         await page.goto(f"{CRONOMETER_URL}/login/", wait_until="domcontentloaded", timeout=30_000)
-        await page.locator("input#username").wait_for(state="visible", timeout=15_000)
 
-    # Need to log in
     await page.locator("input#username").fill(username)
     await page.locator("input#password").fill(password)
     await page.locator("button#login-button").click()
@@ -204,21 +307,16 @@ async def _login(page: Page, username: str, password: str, ctx=None) -> None:
             timeout=25_000,
         )
     except PWTimeout:
-        err_loc = page.locator('p:has-text("Too Many"), div:has-text("Too Many"), [class*="error"]').first
+        err_loc = page.locator('p:has-text("Too Many"), div:has-text("Too Many")').first
         if await err_loc.count() > 0:
-            try:
-                msg = await err_loc.inner_text(timeout=2_000)
-                raise RuntimeError(f"Cronometer login blocked: {msg.strip()!r}")
-            except Exception:
-                pass
+            msg = await err_loc.inner_text(timeout=2_000)
+            raise RuntimeError(f"Cronometer login blocked: {msg.strip()!r}")
         raise RuntimeError(
-            f"Login timed out (still on {page.url}). "
-            "Cronometer may have rate-limited this account — wait a few minutes and try again."
+            "Login timed out. Cronometer may be rate-limiting — wait a few minutes."
         )
 
-    # Wait for GWT app to fully load, then save session
     await page.locator('a.btn-sidebar:has-text("Diary")').wait_for(state="visible", timeout=20_000)
-    print(f"  Logged in → {page.url}", flush=True)
+    print(f"  Logged in via browser.", flush=True)
     if ctx:
         SESSION_FILE.write_text(json.dumps(await ctx.storage_state()))
         print("  Session saved.", flush=True)

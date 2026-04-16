@@ -72,9 +72,13 @@ Playwright automates the Cronometer UI:
 git clone https://github.com/Asian-Dave/Calorie-Tracker-Cronometer-Automation
 cd calorie-tracker
 
-# 2. Create your credentials file from the example
-cp auth.json.example auth.json
-# Edit auth.json and fill in your Cronometer email and password
+# 2. Store your Cronometer credentials securely
+./setup.sh
+# Stores credentials in the most secure location available for your platform:
+#   macOS              → macOS Keychain
+#   Linux (desktop)    → GNOME Keyring / KWallet via secret-tool
+#   Linux (headless)   → .env file with chmod 600 (Raspberry Pi etc.)
+# Credentials are never stored in the Docker image or committed to the repo.
 
 # 3. Create your config file from the example
 cp config.json.example config.json
@@ -83,6 +87,14 @@ cp config.json.example config.json
 # 4. Build the Docker image (one-time, takes a few minutes)
 docker compose build
 ```
+
+> **Note:** `auth.json` is still supported as a fallback if you prefer it, but `./setup.sh` is the recommended approach.
+
+## On credentials & security
+
+`setup.sh` uses the most secure storage available on your platform. Credentials are read from the keychain at runtime by `add_meal.sh` and passed into the Docker container as ephemeral environment variables — they are never written to disk inside the container, never baked into the image, and never committed to the repo.
+
+On a **Raspberry Pi or any headless Linux** machine with no keychain daemon running, `setup.sh` falls back to a `.env` file with `chmod 600` permissions, readable only by your user account.
 
 ## Daily usage
 
@@ -166,9 +178,10 @@ All flags override the corresponding `config.json` default.
 calorie-tracker/
 ├── add_meal.sh          # Entry point — run this daily
 ├── add_meal.py          # Playwright browser automation (runs inside Docker)
+├── setup.sh             # One-time credential setup (keychain / .env)
 ├── config.json          # Your personal defaults (git-ignored)
 ├── config.json.example  # Template showing the expected format
-├── auth.json            # Your Cronometer credentials (git-ignored)
+├── auth.json            # Legacy credentials fallback (git-ignored)
 ├── auth.json.example    # Template showing the expected format
 ├── Dockerfile           # Playwright + Python container image
 ├── docker-compose.yml   # Container configuration
@@ -177,7 +190,7 @@ calorie-tracker/
 
 ## Credentials & config
 
-Both `auth.json` and `config.json` are listed in `.gitignore` and will never be committed. Copy the `.example` files, fill them in, and they stay local to your machine.
+`config.json` and `auth.json` are listed in `.gitignore` and will never be committed. The preferred credential storage is via `./setup.sh` which uses your OS keychain. The `.env` and `.crono_user` files created on headless Linux are also git-ignored.
 
 ## Troubleshooting
 
