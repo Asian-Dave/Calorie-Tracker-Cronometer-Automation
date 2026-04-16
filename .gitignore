@@ -1,4 +1,5 @@
 auth.json
+config.json
 .session.json
 debug_*.png
 debug_*.html

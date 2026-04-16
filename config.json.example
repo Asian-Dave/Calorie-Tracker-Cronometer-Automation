@@ -1,0 +1,7 @@
+{
+    "defaults": {
+        "meal": "Lunch",
+        "portion": "normal",
+        "date_offset": 0
+    }
+}

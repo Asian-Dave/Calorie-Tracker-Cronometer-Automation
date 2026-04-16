@@ -38,17 +38,28 @@ def load_credentials() -> tuple[str, str]:
 
 # ── Ingredient breakdown via Claude ────────────────────────────────────────────
 
-def breakdown_ingredients(meal_description: str) -> dict:
+PORTION_SCALE = {"small": 0.75, "normal": 1.0, "generous": 1.25, "large": 1.5}
+
+
+def breakdown_ingredients(meal_description: str, portion: str = "normal") -> dict:
     """Ask Claude to break the meal into individual Cronometer-searchable components."""
+    scale = PORTION_SCALE.get(portion, 1.0)
+    portion_note = (
+        f"Portion size: {portion} (scale all gram amounts by {scale:.2f} — "
+        f"{'slightly less than' if scale < 1 else 'slightly more than' if scale > 1 else ''} a standard canteen serving)."
+        if portion != "normal" else "Portion size: normal (standard canteen serving)."
+    )
     prompt = (
         "You are a registered dietitian with expertise in German/European cafeteria food.\n"
         "Break this meal into individual components for Cronometer food diary tracking.\n"
-        "Use English ingredient names that Cronometer's food database would recognise.\n\n"
+        "Use English ingredient names that Cronometer's USDA/NCCDB food database would recognise — "
+        "prefer generic names (e.g. 'hamburger bun white' over brand names).\n"
+        f"{portion_note}\n\n"
         f"Meal: {meal_description}\n\n"
         "Reply with ONLY a valid JSON object, no markdown, no explanation:\n"
         '{"meal_name":"<short meal name>",'
         '"ingredients":['
-        '{"search_name":"<English name for Cronometer search>",'
+        '{"search_name":"<English name for Cronometer search, 2-4 words, generic>",'
         '"amount_g":<number>,'
         '"calories":<integer>,'
         '"protein_g":<number>,'
@@ -102,6 +113,8 @@ async def cronometer_add(
     data: dict,
     log_date: str,
     visible: bool,
+    debug: bool = False,
+    meal_section: str = "Lunch",
 ) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -117,6 +130,8 @@ async def cronometer_add(
 
 
         async def shot(name: str) -> None:
+            if not debug:
+                return
             p = BASE_DIR / f"debug_{name}.png"
             await page.screenshot(path=str(p), full_page=True)
             print(f"  [screenshot] debug_{name}.png", flush=True)
@@ -130,14 +145,22 @@ async def cronometer_add(
             ingredients = data["ingredients"]
             for idx, ing in enumerate(ingredients):
                 print(f"\n  [{idx+1}/{len(ingredients)}] {ing['search_name']} ({ing['amount_g']}g, {ing['calories']} kcal)", flush=True)
-                await _add_one_ingredient(page, ing, shot, idx)
+                await _add_one_ingredient(page, ing, shot, idx, meal_section=meal_section)
 
             await shot("final")
             print(f"\n✓  {len(ingredients)} ingredient(s) added to Cronometer diary!", flush=True)
+            # Clean up any leftover debug files from previous runs
+            for f in BASE_DIR.glob("debug_*.png"):
+                f.unlink(missing_ok=True)
+            for f in BASE_DIR.glob("debug_*.html"):
+                f.unlink(missing_ok=True)
 
         except Exception as exc:
-            await shot("error")
+            # Always save an error screenshot regardless of debug flag
+            p = BASE_DIR / "debug_error.png"
+            await page.screenshot(path=str(p), full_page=True)
             print(f"\nError: {exc}", file=sys.stderr, flush=True)
+            print(f"Screenshot saved → debug_error.png", file=sys.stderr, flush=True)
             raise
         finally:
             if visible:
@@ -227,10 +250,56 @@ async def _navigate_diary(page: Page, log_date: str) -> None:
     await page.wait_for_selector('button.button-panel-btn', state="attached", timeout=15_000)
     await _dismiss_popups(page)
     await page.wait_for_timeout(500)
-    print(f"  Diary loaded. URL: {page.url}", flush=True)
+
+    # Navigate to the correct date if not today
     today = date.today().isoformat()
     if log_date != today:
-        print(f"  Note: logging to current diary date (date nav not yet implemented).", flush=True)
+        await _navigate_to_date(page, log_date)
+
+    print(f"  Diary loaded. URL: {page.url}", flush=True)
+
+
+async def _navigate_to_date(page: Page, target_date: str) -> None:
+    """Click the prev/next arrows in the diary header to reach the target date."""
+    from datetime import datetime, timedelta
+
+    target = datetime.fromisoformat(target_date).date()
+    today  = date.today()
+    delta  = (target - today).days  # negative = past, positive = future
+
+    if delta == 0:
+        return
+
+    arrow = "button.diary-nav-forward" if delta > 0 else "button.diary-nav-back"
+    # Cronometer uses left/right chevron buttons next to the date header
+    # Try a few selector patterns since GWT class names vary
+    prev_sel = '[title="Previous Day"], .diary-nav-back, button:has-text("chevron_left")'
+    next_sel = '[title="Next Day"], .diary-nav-forward, button:has-text("chevron_right")'
+    sel = next_sel if delta > 0 else prev_sel
+    clicks = abs(delta)
+
+    print(f"  Navigating {clicks} day(s) {'forward' if delta > 0 else 'back'} to {target_date}…", flush=True)
+    for _ in range(clicks):
+        nav_btn = page.locator(sel).first
+        try:
+            await nav_btn.wait_for(state="visible", timeout=3_000)
+            await nav_btn.click()
+            await page.wait_for_timeout(800)
+        except PWTimeout:
+            # Try via JS as fallback
+            clicked = await page.evaluate(f"""() => {{
+                const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                const b = btns.find(b => b.offsetParent !== null && (
+                    b.title?.includes('{"Next" if delta > 0 else "Previous"}') ||
+                    b.innerText?.trim() === '{"chevron_right" if delta > 0 else "chevron_left"}'
+                ));
+                if (b) {{ b.click(); return true; }}
+                return false;
+            }}""")
+            if not clicked:
+                print(f"  Warning: could not navigate to {target_date}, logging to current date.", flush=True)
+                return
+            await page.wait_for_timeout(800)
 
 
 async def _open_food_dialog(page: Page) -> None:
@@ -250,17 +319,42 @@ async def _open_food_dialog(page: Page) -> None:
 
 
 def _search_fallbacks(name: str) -> list[str]:
-    """Return progressively simpler search terms to try before giving up."""
+    """
+    Return progressively simpler/alternative search terms to try before giving up.
+    Asks Claude for DB-friendly alternatives so we prefer real DB entries over custom foods.
+    """
     words = name.split()
+    # Start with the original + simple word truncations
     candidates = [name]
-    # Try first two keywords, then just first keyword
     if len(words) >= 3:
         candidates.append(" ".join(words[:2]))
     if len(words) >= 2:
         candidates.append(words[0])
+
+    # Ask Claude for alternative USDA/NCCDB-style names
+    try:
+        result = subprocess.run(
+            ["claude", "-p",
+             f"A user wants to find '{name}' in the Cronometer food database (USDA/NCCDB). "
+             "Suggest 3 alternative generic English search terms that are likely to match "
+             "real entries in the USDA food database. Order from most specific to most generic. "
+             "Reply with ONLY a JSON array of strings, no explanation: "
+             '[\"term1\", \"term2\", \"term3\"]'],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            text = result.stdout.strip()
+            if "```" in text:
+                text = re.sub(r"```\w*\n?", "", text).strip()
+            alternatives = json.loads(text)
+            if isinstance(alternatives, list):
+                candidates.extend(alternatives)
+    except Exception:
+        pass  # Silently fall back to simple truncation if Claude call fails
+
     # Deduplicate while preserving order
-    seen = set()
-    return [c for c in candidates if not (c in seen or seen.add(c))]
+    seen: set = set()
+    return [c for c in candidates if c and not (c.lower() in seen or seen.add(c.lower()))]
 
 
 async def _search_and_pick(page: Page, search_term: str) -> bool:
@@ -279,7 +373,7 @@ async def _search_and_pick(page: Page, search_term: str) -> bool:
     return await page.locator(f'td:has-text("{keyword}")').count() > 0
 
 
-async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int) -> None:
+async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_section: str = "Lunch") -> None:
     """Add one ingredient: try progressively simpler DB searches, then custom food."""
     name     = ing["search_name"]
     target_g = float(ing["amount_g"])
@@ -308,12 +402,12 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int) -> None:
         await _dismiss_popups(page)  # remove any popup that appeared after click
         await shot(f"ing{idx}_selected")
 
-        # ── Diary Group → Lunch ─────────────────────────────────────────────
+        # ── Diary Group → target meal section ──────────────────────────────
         group_btn = page.locator('button.dropdown-btn:has-text("Uncategorized")').first
         if await group_btn.count() > 0:
             await group_btn.click()
             await page.wait_for_timeout(300)
-            await page.locator('.dropdown-item:text-is("Lunch")').first.click()
+            await page.locator(f'.dropdown-item:text-is("{meal_section}")').first.click()
             await page.wait_for_timeout(300)
 
         # ── Serving quantity ────────────────────────────────────────────────
@@ -454,6 +548,16 @@ def main() -> None:
     parser.add_argument("--date", default=date.today().isoformat(), metavar="YYYY-MM-DD")
     parser.add_argument("--visible", action="store_true", help="Show browser window")
     parser.add_argument("--estimate-only", action="store_true")
+    parser.add_argument("--debug", action="store_true",
+                        help="Save debug screenshots at each step")
+    parser.add_argument("--meal",
+                        default="Lunch",
+                        choices=["Breakfast", "Lunch", "Dinner", "Snacks"],
+                        help="Diary section to log into (default: Lunch)")
+    parser.add_argument("--portion",
+                        default="normal",
+                        choices=list(PORTION_SCALE.keys()),
+                        help="Portion size hint (default: normal)")
     parser.add_argument("--nutrition-from-stdin", action="store_true",
                         help="Read ingredient JSON from stdin (used by add_meal.sh)")
     args = parser.parse_args()
@@ -472,7 +576,10 @@ def main() -> None:
         username, password = load_credentials()
         print("Starting Playwright automation…", flush=True)
         try:
-            asyncio.run(cronometer_add(username, password, data, args.date, visible=False))
+            asyncio.run(cronometer_add(
+                username, password, data, args.date,
+                visible=False, debug=args.debug, meal_section=args.meal,
+            ))
         except Exception as exc:
             print(f"\nAutomation failed: {exc}", file=sys.stderr, flush=True)
             sys.exit(1)
@@ -498,9 +605,9 @@ def main() -> None:
         print("Error: no meal description provided.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"\nBreaking down: {meal[:80]}…")
+    print(f"\nBreaking down: {meal[:80]}… (portion: {args.portion})")
     try:
-        data = breakdown_ingredients(meal)
+        data = breakdown_ingredients(meal, portion=args.portion)
     except (json.JSONDecodeError, KeyError) as exc:
         print(f"Could not parse Claude's response: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -521,7 +628,10 @@ def main() -> None:
 
     username, password = load_credentials()
     try:
-        asyncio.run(cronometer_add(username, password, data, args.date, visible=args.visible))
+        asyncio.run(cronometer_add(
+        username, password, data, args.date,
+        visible=args.visible, debug=args.debug, meal_section=args.meal,
+    ))
     except Exception:
         sys.exit(1)
 
