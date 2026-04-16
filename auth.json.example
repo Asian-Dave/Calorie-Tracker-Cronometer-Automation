@@ -1,0 +1,8 @@
+{
+    "http-basic": {
+        "https://cronometer.com": {
+            "username": "your-email@example.com",
+            "password": "your-cronometer-password"
+        }
+    }
+}

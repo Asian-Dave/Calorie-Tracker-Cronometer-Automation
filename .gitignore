@@ -1,0 +1,9 @@
+auth.json
+.session.json
+debug_*.png
+debug_*.html
+probe.py
+__pycache__/
+*.pyc
+/image reference.png
+/.idea/vcs.xml

@@ -1,0 +1,5 @@
+auth.json
+.cronometer_session.json
+*.png
+.idea
+debug_screenshot.png
