@@ -86,14 +86,14 @@ LOG_DATE_OFFSET=$(_cfg date_offset 0)
 LOG_DATE=$(date -v+"${LOG_DATE_OFFSET}d" +%Y-%m-%d 2>/dev/null || date -d "+${LOG_DATE_OFFSET} days" +%Y-%m-%d)
 ESTIMATE_ONLY=false
 DEBUG=false
-MEAL=$(_cfg meal "Lunch")
+MEAL_SECTION=$(_cfg meal "Lunch")
 PORTION=$(_cfg portion "normal")
 
 # ── Argument parsing — flags override config defaults ─────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --date)          LOG_DATE="$2"; shift 2 ;;
-        --meal)          MEAL="$2"; shift 2 ;;
+        --meal)          MEAL_SECTION="$2"; shift 2 ;;
         --portion)       PORTION="$2"; shift 2 ;;
         --estimate-only) ESTIMATE_ONLY=true; shift ;;
         --debug)         DEBUG=true; shift ;;
@@ -103,29 +103,29 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "Using defaults → meal: $MEAL | portion: $PORTION | date: $LOG_DATE"
+echo "Using defaults → meal: $MEAL_SECTION | portion: $PORTION | date: $LOG_DATE"
 
-MEAL="${*:-}"
+FOOD_DESCRIPTION="${*:-}"
 
 # ── Interactive input if no meal given ────────────────────────────────────────
-if [[ -z "$MEAL" ]]; then
+if [[ -z "$FOOD_DESCRIPTION" ]]; then
     echo "Paste the meal description (press Enter twice when done):"
     lines=()
     while IFS= read -r line; do
         [[ -z "$line" ]] && (( ${#lines[@]} > 0 )) && break
         lines+=("$line")
     done
-    MEAL=$(printf '%s\n' "${lines[@]}")
+    FOOD_DESCRIPTION=$(printf '%s\n' "${lines[@]}")
 fi
 
-if [[ -z "$MEAL" ]]; then
+if [[ -z "$FOOD_DESCRIPTION" ]]; then
     echo "Error: no meal description provided." >&2
     exit 1
 fi
 
 # ── Estimate nutrition via Claude Code on the host ────────────────────────────
 echo ""
-echo "Estimating nutrition for: ${MEAL:0:80}..."
+echo "Estimating nutrition for: ${FOOD_DESCRIPTION:0:80}..."
 
 TMPJSON=$(mktemp /tmp/meal_nutrition_XXXXXX.json)
 trap 'rm -f "$TMPJSON"' EXIT
@@ -142,10 +142,10 @@ Break this meal into individual components for Cronometer food diary tracking.
 Use English ingredient names that Cronometer's USDA/NCCDB food database would recognise — prefer generic names (e.g. 'hamburger bun white' over brand names).
 ${PORTION_NOTE}
 
-Meal: ${MEAL}
+Meal: ${FOOD_DESCRIPTION}
 
 Reply with ONLY a valid JSON object, no markdown, no explanation:
-{\"meal_name\":\"<short name>\",\"ingredients\":[{\"search_name\":\"<English name for Cronometer search, 2-4 words, generic>\",\"amount_g\":<number>,\"calories\":<integer>,\"protein_g\":<number>,\"fat_g\":<number>,\"carbs_g\":<number>,\"fiber_g\":<number>,\"sugar_g\":<number>,\"sodium_mg\":<number>}]}" > "$TMPJSON"
+{\"meal_name\":\"<short name>\",\"ingredients\":[{\"search_name\":\"<English name for Cronometer search, 2-4 words, generic>\",\"amount_g\":<number>,\"calories\":<integer>,\"protein_g\":<number>,\"fat_g\":<number>,\"carbs_g\":<number>,\"fiber_g\":<number>,\"sugar_g\":<number>,\"sodium_mg\":<number>}]}" </dev/null > "$TMPJSON"
 
 # ── Display ingredient table ───────────────────────────────────────────────────
 python3 - "$TMPJSON" <<'PYEOF'
@@ -174,7 +174,7 @@ PYEOF
 [[ "$ESTIMATE_ONLY" == "true" ]] && exit 0
 
 # ── Confirm ────────────────────────────────────────────────────────────────────
-read -rp $"\nLog this to Cronometer for ${LOG_DATE}? [Y/n]: " CONFIRM
+read -rp $"\nLog this to Cronometer for ${LOG_DATE}? [Y/n]: " CONFIRM < /dev/tty
 CONFIRM="${CONFIRM:-y}"
 [[ "$CONFIRM" =~ ^[Nn] ]] && { echo "Aborted."; exit 0; }
 
@@ -182,7 +182,7 @@ CONFIRM="${CONFIRM:-y}"
 # -T disables TTY allocation (piping stdin); the container reads the JSON and
 # runs Playwright headlessly — no interaction needed at this point.
 echo ""
-DOCKER_FLAGS="--nutrition-from-stdin --date $LOG_DATE --meal $MEAL"
+DOCKER_FLAGS="--nutrition-from-stdin --date $LOG_DATE --section $MEAL_SECTION"
 [[ "$DEBUG"   == "true" ]] && DOCKER_FLAGS="$DOCKER_FLAGS --debug"
 
 docker compose run --rm -T \

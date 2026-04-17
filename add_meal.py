@@ -413,6 +413,8 @@ async def _open_food_dialog(page: Page) -> None:
     await page.locator('input[placeholder="Search all foods & recipes..."]').first.wait_for(
         state="visible", timeout=8_000
     )
+    # Dismiss any consent overlay that reappeared after the dialog opened
+    await _dismiss_popups(page)
     await page.wait_for_timeout(500)
 
 
@@ -493,20 +495,51 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
         keyword = found_term.split()[0]
         print(f"    Found — clicking first match for {found_term!r}.", flush=True)
 
-        # Click result row — overlays are removed so Playwright click works
-        result_row = page.locator(f'td:has-text("{keyword}")').first
-        await result_row.click()
-        await page.wait_for_timeout(1_200)
+        # Dismiss any consent overlay right before clicking the result row,
+        # then give the DOM time to settle.
+        await _dismiss_popups(page)
+        await page.wait_for_timeout(600)
+
+        # Use Playwright's CDP force-click (real mouse events via DevTools Protocol).
+        # JS dispatchEvent does NOT reliably trigger GWT's event handlers — only CDP does.
+        # Try selectors in preference order; the first one that resolves to ≥1 element wins.
+        click_succeeded = False
+        for sel in [
+            f'td.no-left-padding:has-text("{keyword}")',
+            f'td[align="left"]:has-text("{keyword}")',
+            f'td:has-text("{keyword}")',
+        ]:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() == 0:
+                    continue
+                await loc.scroll_into_view_if_needed(timeout=2_000)
+                await loc.click(force=True, timeout=5_000)
+                click_succeeded = True
+                break
+            except PWTimeout:
+                continue
+
+        if not click_succeeded:
+            print(f"    Warning: could not click result row for {found_term!r}.", flush=True)
+
+        await page.wait_for_timeout(1_800)
         await _dismiss_popups(page)  # remove any popup that appeared after click
         await shot(f"ing{idx}_selected")
 
         # ── Diary Group → target meal section ──────────────────────────────
         group_btn = page.locator('button.dropdown-btn:has-text("Uncategorized")').first
-        if await group_btn.count() > 0:
-            await group_btn.click()
+        try:
+            await group_btn.wait_for(state="visible", timeout=5_000)
+            await group_btn.scroll_into_view_if_needed()
+            await group_btn.click(force=True)
             await page.wait_for_timeout(300)
-            await page.locator(f'.dropdown-item:text-is("{meal_section}")').first.click()
+            item = page.locator(f'.dropdown-item:text-is("{meal_section}")').first
+            await item.click(force=True)
             await page.wait_for_timeout(300)
+            print(f"    Diary group → {meal_section}", flush=True)
+        except PWTimeout:
+            print(f"    (Diary group dropdown not found, skipping)", flush=True)
 
         # ── Serving quantity ────────────────────────────────────────────────
         serving_text = await page.evaluate("""() => {
@@ -535,9 +568,10 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
         await page.wait_for_timeout(300)
 
         # ── ADD TO DIARY ────────────────────────────────────────────────────
-        add_btn = page.locator('button:has-text("ADD TO DIARY")').first
-        await add_btn.wait_for(state="visible", timeout=6_000)
-        await add_btn.click()
+        # The button DOM text is "Add to Diary"; has-text is case-insensitive.
+        add_btn = page.locator('button.btn-flat-jungle-green:has-text("Add to Diary")').first
+        await add_btn.wait_for(state="visible", timeout=8_000)
+        await add_btn.click(force=True)
 
         # Confirm: dialog should close (ADD TO DIARY button disappears)
         try:
@@ -648,7 +682,7 @@ def main() -> None:
     parser.add_argument("--estimate-only", action="store_true")
     parser.add_argument("--debug", action="store_true",
                         help="Save debug screenshots at each step")
-    parser.add_argument("--meal",
+    parser.add_argument("--section",
                         default="Lunch",
                         choices=["Breakfast", "Lunch", "Dinner", "Snacks"],
                         help="Diary section to log into (default: Lunch)")
@@ -676,7 +710,7 @@ def main() -> None:
         try:
             asyncio.run(cronometer_add(
                 username, password, data, args.date,
-                visible=False, debug=args.debug, meal_section=args.meal,
+                visible=False, debug=args.debug, meal_section=args.section,
             ))
         except Exception as exc:
             print(f"\nAutomation failed: {exc}", file=sys.stderr, flush=True)
@@ -728,7 +762,7 @@ def main() -> None:
     try:
         asyncio.run(cronometer_add(
         username, password, data, args.date,
-        visible=args.visible, debug=args.debug, meal_section=args.meal,
+        visible=args.visible, debug=args.debug, meal_section=args.section,
     ))
     except Exception:
         sys.exit(1)
