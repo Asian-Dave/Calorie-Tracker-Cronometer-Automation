@@ -557,13 +557,18 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
             print(f"    (Diary group dropdown not found, skipping)", flush=True)
 
         # ── Serving quantity ────────────────────────────────────────────────
-        # Strategy: always open the serving dropdown, prefer the pure "g" option
-        # (1 g/unit → enter target_g directly). Fall back to any gram-labelled option
-        # (calculate ratio). If no gram option at all, keep qty=1.
-
+        # Strategy:
+        #  1. Open dropdown, prefer pure "g" unit.
+        #  2. If "g" selected: calibrate by entering 100g, reading Cronometer's
+        #     displayed kcal for 100g, then computing grams = target_cal*100/db_kcal.
+        #     This corrects for caloric-density differences between AI and the DB.
+        #  3. If only a named serving with gram weight exists: calculate qty ratio.
+        #  4. Fallback: qty = 1.
+        target_cal = float(ing["calories"])
+        using_gram_unit = False
         qty_val = "1"
 
-        # Open the serving dropdown and capture the current label
+        # Open the serving dropdown and capture the current button label
         current_serving = await page.evaluate("""() => {
             const btns = Array.from(document.querySelectorAll('button.dropdown-btn.dropdown-toggle'))
                 .filter(b => b.offsetParent !== null &&
@@ -581,7 +586,7 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
             }""")
             print(f"    Serving: {current_serving!r} | options: {dropdown_items[:6]}", flush=True)
 
-            # Prefer exact "g" unit (1 g each); otherwise first option that names a gram weight
+            # Prefer exact "g" unit; otherwise first named option with a gram weight
             chosen_text = None
             chosen_g = None
             for opt in dropdown_items:
@@ -601,35 +606,25 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
                         has_text=re.compile(r'^\s*' + re.escape(chosen_text) + r'\s*$')
                     ).first
                     await item_loc.click(force=True, timeout=3_000)
-                    await page.wait_for_timeout(800)  # let GWT re-render the qty field
-                    qty_val = (f"{target_g:.1f}" if chosen_g == 1.0
-                               else f"{target_g / chosen_g:.2f}")
-                    print(f"    Unit → {chosen_text!r}, qty={qty_val}", flush=True)
+                    await page.wait_for_timeout(800)
+                    using_gram_unit = (chosen_g == 1.0)
+                    qty_val = str(target_g) if using_gram_unit else f"{target_g / chosen_g:.2f}"
+                    print(f"    Unit → {chosen_text!r}", flush=True)
                 except PWTimeout:
                     await page.keyboard.press("Escape")
-                    print(f"    Dropdown click failed, qty=1", flush=True)
+                    print(f"    Dropdown click failed", flush=True)
             else:
-                # No gram option in list — check if current label already encodes grams
+                # No gram option — fall back to ratio from current serving label
                 gm = re.search(r"(\d+(?:\.\d+)?)\s*g\b", current_serving)
                 if gm:
                     qty_val = f"{target_g / float(gm.group(1)):.2f}"
-                    print(f"    No gram unit; ratio from label → qty={qty_val}", flush=True)
-                else:
-                    print(f"    No gram option found, qty=1", flush=True)
                 await page.keyboard.press("Escape")
                 await page.wait_for_timeout(300)
+                print(f"    No gram unit (options: {dropdown_items[:4]}), qty={qty_val}", flush=True)
         else:
-            print(f"    Serving dropdown not found, qty=1", flush=True)
+            print(f"    Serving dropdown not found", flush=True)
 
-        # Find the qty input: last visible input that is not the food search box.
-        # Do NOT filter by current value — it may be empty or "1" after a unit switch.
-        qty_debug = await page.evaluate("""() => {
-            const all = Array.from(document.querySelectorAll('input'));
-            return all.filter(e => e.offsetParent !== null).map(e => ({
-                cls: e.className, v: e.value, ph: e.placeholder, type: e.type
-            }));
-        }""")
-        print(f"    DBG inputs: {qty_debug}", flush=True)
+        # Find the qty input: last visible input that is not the food search box
         qty_input_idx = await page.evaluate("""() => {
             const all = Array.from(document.querySelectorAll('input'));
             const vis = all.filter(e => e.offsetParent !== null
@@ -637,14 +632,57 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
             const inp = vis[vis.length - 1];
             return inp ? all.indexOf(inp) : -1;
         }""")
+
         if qty_input_idx >= 0:
             qty_loc = page.locator('input').nth(qty_input_idx)
             await qty_loc.scroll_into_view_if_needed(timeout=2_000)
-            await qty_loc.click(click_count=3)    # triple-click selects existing value
+
+            if using_gram_unit and target_cal > 0:
+                # ── Calorie calibration ─────────────────────────────────────────
+                # Enter 100g as a reference quantity, read what Cronometer shows for
+                # 100g (avoids rounding-to-zero issues with 1g), then compute the
+                # gram amount that matches the AI calorie estimate exactly.
+                await qty_loc.click(click_count=3)
+                await qty_loc.press_sequentially("100", delay=40)
+                await qty_loc.press("Tab")
+                await page.wait_for_timeout(700)
+
+                db_kcal_100 = await page.evaluate("""() => {
+                    // Anchor on the "Add to Diary" button to stay inside the food
+                    // detail panel — avoids reading calorie values from search rows.
+                    const addBtn = Array.from(document.querySelectorAll('button'))
+                        .find(b => b.offsetParent !== null
+                                && /add to diary/i.test(b.innerText?.trim()));
+                    let el = addBtn?.parentElement;
+                    for (let i = 0; i < 8 && el; i++) {
+                        const t = el.innerText || '';
+                        // Match "NNN kcal" or "kcal NNN" — use [0-9] and \\s to avoid
+                        // Python interpreting \\d/\\b/\\n as escape sequences.
+                        const m = t.match(/([0-9]{1,4})\\s*kcal/i)
+                               || t.match(/kcal\\s*([0-9]{1,4})/i);
+                        if (m) {
+                            const n = parseInt(m[1]);
+                            if (n > 0 && n < 5000) return n;
+                        }
+                        el = el.parentElement;
+                    }
+                    return null;
+                }""")
+
+                if db_kcal_100 and db_kcal_100 > 0:
+                    final_g = round(target_cal * 100 / db_kcal_100, 1)
+                    print(f"    Cal: {db_kcal_100} kcal/100g → {final_g}g for {int(target_cal)} kcal", flush=True)
+                    qty_val = str(final_g)
+                else:
+                    print(f"    Cal: density read failed, using AI estimate {target_g}g", flush=True)
+                    qty_val = str(target_g)
+
+            # Enter the final quantity
+            await qty_loc.click(click_count=3)
             await qty_loc.press_sequentially(qty_val, delay=40)
-            await qty_loc.press("Tab")            # blur → GWT commits the value
+            await qty_loc.press("Tab")
             await page.wait_for_timeout(600)
-            print(f"    Set qty={qty_val}", flush=True)
+            print(f"    Set qty={qty_val}g", flush=True)
         else:
             print(f"    Warning: qty input not found", flush=True)
 
