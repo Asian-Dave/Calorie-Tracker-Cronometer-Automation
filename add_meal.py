@@ -133,6 +133,7 @@ async def cronometer_add(
             ctx_kwargs["storage_state"] = json.loads(SESSION_FILE.read_text())
             print("  Loaded saved session.", flush=True)
         ctx  = await browser.new_context(**ctx_kwargs)
+        await _install_consent_bypass(ctx)
         page = await ctx.new_page()
 
 
@@ -279,20 +280,25 @@ async def _login(page: Page, username: str, password: str, ctx=None) -> None:
     # Navigate to the app — with cookies injected it should load directly
     await page.goto(f"{CRONOMETER_URL}/login/", wait_until="domcontentloaded", timeout=30_000)
 
-    # Wait for GWT app or login form
+    # Wait for GWT app or login form.
+    # On timeout we may have landed on the marketing page (stale session cookies
+    # caused a redirect to https://cronometer.com/ which has neither the app sidebar
+    # nor the login form).  Don't raise here — fall through to browser login instead.
     try:
         await page.wait_for_selector(
             'a.btn-sidebar:has-text("Diary"), input#username',
             state="visible", timeout=25_000,
         )
     except PWTimeout:
-        raise RuntimeError(f"Timed out waiting for Cronometer app at {page.url}")
+        pass  # handled below — browser login will recover
 
     if await page.locator('a.btn-sidebar:has-text("Diary")').is_visible():
         print("  App loaded.", flush=True)
         return
 
-    # HTTP cookies weren't enough — browser login fallback
+    # Cookies weren't enough (or timed out on marketing page) — browser login fallback.
+    # Delete any stale session so it doesn't interfere on the next run.
+    SESSION_FILE.unlink(missing_ok=True)
     print("  Cookies not accepted, logging in via browser…", flush=True)
     if "/login" not in page.url:
         await page.goto(f"{CRONOMETER_URL}/login/", wait_until="domcontentloaded", timeout=30_000)
@@ -322,15 +328,87 @@ async def _login(page: Page, username: str, password: str, ctx=None) -> None:
         print("  Session saved.", flush=True)
 
 
+_CONSENT_BYPASS_SCRIPT = """
+// Suppress all Cronometer consent / CMP overlays.
+//
+// Strategy:
+//   1. Lock __tcfapi / __cmp with Object.defineProperty (non-writable,
+//      non-configurable) so the CMP script cannot overwrite our stub.
+//   2. MutationObserver removes CMP DOM nodes the instant they appear.
+(function () {
+    // ── 1. Lock the IAB TCF / CMP stubs ──────────────────────────────────────
+    const _ok = { gdprApplies: false, tcString: '', eventStatus: 'tcloaded',
+                  cmpStatus: 'loaded', purposeOneTreatment: false, publisherCC: 'DE' };
+    function _stub(cmd, ver, cb) { if (typeof cb === 'function') cb(_ok, true); }
+
+    for (const name of ['__tcfapi', '__cmp', '__uspapi']) {
+        try {
+            Object.defineProperty(window, name, {
+                value: _stub,
+                writable: false,
+                configurable: false,
+            });
+        } catch (e) { /* already defined non-configurable */ }
+    }
+
+    // ── 2. DOM kill function ──────────────────────────────────────────────────
+    const CMP_IDS      = ['ncmp__tool', 'qc-cmp2-container', 'qc-cmp2-ui',
+                          'sp_message_container'];
+    const CMP_PREFIXES = ['qc-cmp', 'cmp2', 'sp_message'];
+
+    function _killBanner() {
+        for (const id of CMP_IDS) {
+            const el = document.getElementById(id);
+            if (el) { el.remove(); return; }
+        }
+        for (const el of document.querySelectorAll('div,aside,section')) {
+            if (el.closest('.gwt-PopupPanel')) continue;
+            const cls = (el.className || '') + ' ' + (el.id || '');
+            if (CMP_PREFIXES.some(p => cls.includes(p))) { el.remove(); return; }
+        }
+        // Last resort: any fixed/absolute overlay with very high z-index
+        // that is NOT a GWT popup and NOT Cronometer's own context menu
+        for (const el of document.querySelectorAll('body > div')) {
+            if (el.closest('.gwt-PopupPanel') || el.id.startsWith('gwt')) continue;
+            if (el.classList.contains('popup-menu')) continue;
+            const s = getComputedStyle(el);
+            if ((s.position === 'fixed' || s.position === 'absolute') &&
+                parseInt(s.zIndex) >= 10000) {
+                el.remove(); return;
+            }
+        }
+    }
+
+    _killBanner();
+    new MutationObserver(_killBanner).observe(
+        document.documentElement, { childList: true, subtree: true }
+    );
+})();
+"""
+
+
+async def _install_consent_bypass(ctx) -> None:
+    """Suppress CMP/consent overlays for every page in this browser context.
+
+    - Registers a JS init-script (runs before page scripts on every navigation).
+    - Blocks requests to the Quantcast CMP CDN at the network level so the
+      script never loads in the first place.
+    """
+    await ctx.add_init_script(_CONSENT_BYPASS_SCRIPT)
+    # Block Quantcast CMP CDN — the modal can't appear if the script never loads
+    await ctx.route(
+        re.compile(r"https?://cmp\.quantcast\.com/"),
+        lambda route, _req: route.abort(),
+    )
+
+
 async def _dismiss_popups(page: Page) -> None:
-    """Remove the cookie consent overlay. Never touches GWT's own popup panels."""
+    """Fallback: forcibly remove any consent overlay still present in the DOM."""
     removed = await page.evaluate("""() => {
         const removed = [];
-        // Click Accept to record consent server-side so it stops appearing
         const accept = Array.from(document.querySelectorAll('button'))
             .find(b => ['accept','accept all','i accept'].includes(b.innerText?.trim().toLowerCase()));
         if (accept) { accept.click(); removed.push('accepted:' + accept.innerText.trim()); }
-        // Only remove the ncmp consent overlay — never GWT's own popup panels
         const ncmp = document.getElementById('ncmp__tool');
         if (ncmp) { ncmp.remove(); removed.push('removed:#ncmp__tool'); }
         return removed;
@@ -791,6 +869,174 @@ async def _create_custom_food(page: Page, ing: dict, shot, idx: int) -> None:
         print(f"    Custom food added.", flush=True)
 
 
+async def cronometer_clear_section(
+    username: str,
+    password: str,
+    section: str,
+    log_date: str,
+    debug: bool = False,
+) -> int:
+    """Remove all food entries from a diary section. Returns number of entries removed."""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--disable-dev-shm-usage"],
+        )
+        ctx_kwargs: dict = {"viewport": {"width": 1280, "height": 900}, "locale": "en-US"}
+        if SESSION_FILE.exists():
+            ctx_kwargs["storage_state"] = json.loads(SESSION_FILE.read_text())
+            print("  Loaded saved session.", flush=True)
+        ctx = await browser.new_context(**ctx_kwargs)
+        await _install_consent_bypass(ctx)
+        page = await ctx.new_page()
+
+        async def shot(name: str) -> None:
+            p = BASE_DIR / f"debug_{name}.png"
+            await page.screenshot(path=str(p), full_page=True)
+            print(f"  Saved {p.name}", flush=True)
+
+        try:
+            await _login(page, username, password, ctx)
+            await _navigate_diary(page, log_date)
+            await _dismiss_popups(page)
+            await shot("clear")
+
+            total_removed = 0
+
+            for _pass in range(30):  # safety cap
+                # Return the actual DOM element so we can scroll it into view and
+                # get fresh viewport coordinates — items below the fold have
+                # getBoundingClientRect().y > viewport height, and mouse.click at
+                # off-screen coordinates silently does nothing in Playwright.
+                handle = await page.evaluate_handle(f"""() => {{
+                    const ALL_SECTIONS = ['Uncategorized','Breakfast','Lunch','Dinner','Snacks'];
+                    const target = {json.dumps(section)};
+                    let inSection = false;
+
+                    for (const tr of document.querySelectorAll('tr')) {{
+                        if (!tr.offsetParent) continue;
+
+                        if (!tr.querySelector('.icon-food')) {{
+                            const txt = (tr.innerText || '').trim();
+                            for (const s of ALL_SECTIONS) {{
+                                if (txt.startsWith(s)) {{ inSection = s === target; break; }}
+                            }}
+                            continue;
+                        }}
+
+                        if (!inSection) continue;
+
+                        // Prefer the food-name cell; fall back to full row
+                        return tr.querySelector('td.no-left-padding')
+                            || tr.querySelector('td[align="left"]')
+                            || tr;
+                    }}
+                    return null;
+                }}""")
+
+                # evaluate_handle returns a JSHandle wrapping null when nothing found
+                is_null = await handle.evaluate("el => el === null")
+                if is_null:
+                    break
+
+                label = await handle.evaluate(
+                    "el => (el.innerText || '').trim().split('\\n')[0]"
+                )
+                print(f"  Right-clicking: {label!r}", flush=True)
+
+                # Scroll the element into the centre of the viewport, then get
+                # fresh coordinates — must happen AFTER scrollIntoView settles.
+                await handle.evaluate("el => el.scrollIntoView({block:'center', inline:'nearest'})")
+                await page.wait_for_timeout(300)
+
+                bbox = await handle.bounding_box()
+                if not bbox:
+                    print("  Could not get bounding box — skipping.", flush=True)
+                    break
+
+                cx = bbox["x"] + bbox["width"]  / 2
+                cy = bbox["y"] + bbox["height"] / 2
+                print(f"  Coordinates after scroll: ({cx:.0f}, {cy:.0f})", flush=True)
+
+                await page.mouse.click(cx, cy, button="right")
+                await page.wait_for_timeout(600)
+
+                # Screenshot BEFORE any cleanup so we see exactly what appeared
+                await shot(f"clear_ctx_raw_{_pass}")
+
+                # Log every visible body-level popup to identify what's in the DOM
+                popups = await page.evaluate("""() =>
+                    Array.from(document.querySelectorAll('body > div, body > aside'))
+                        .filter(e => e.offsetParent !== null)
+                        .map(e => ({
+                            id:    e.id || '(no id)',
+                            cls:   (e.className || '').substring(0, 60),
+                            z:     getComputedStyle(e).zIndex,
+                            pos:   getComputedStyle(e).position,
+                            text:  (e.innerText || '').trim().substring(0, 80),
+                        }))
+                """)
+                print(f"  Body-level popups: {popups}", flush=True)
+
+                # Nuke any CMP overlay — but explicitly spare Cronometer's popup-menu
+                await page.evaluate("""() => {
+                    for (const id of ['ncmp__tool','qc-cmp2-container','qc-cmp2-ui',
+                                      'sp_message_container']) {
+                        const el = document.getElementById(id);
+                        if (el) { el.remove(); return; }
+                    }
+                    for (const el of document.querySelectorAll('body > div')) {
+                        if (el.closest('.gwt-PopupPanel') || (el.id||'').startsWith('gwt')) continue;
+                        if (el.classList.contains('popup-menu')) continue;
+                        const s = getComputedStyle(el);
+                        if ((s.position==='fixed'||s.position==='absolute') &&
+                            parseInt(s.zIndex) >= 10000) { el.remove(); return; }
+                    }
+                }""")
+                await page.wait_for_timeout(200)
+
+                await shot(f"clear_ctx_{_pass}")
+
+                # Click "Delete Selected Items" in the GWT context menu
+                try:
+                    delete_item = page.get_by_text("Delete Selected Items").first
+                    await delete_item.wait_for(state="visible", timeout=4_000)
+                    await delete_item.click(force=True)
+                except PWTimeout:
+                    print(
+                        "  'Delete Selected Items' not found — context menu did not open.",
+                        flush=True,
+                    )
+                    await page.keyboard.press("Escape")
+                    break
+
+                # Cronometer shows a "Delete Items? YES / NO" confirmation dialog
+                try:
+                    yes_btn = page.get_by_role("button", name="YES").first
+                    await yes_btn.wait_for(state="visible", timeout=3_000)
+                    await yes_btn.click(force=True)
+                    print(f"  Confirmed deletion.", flush=True)
+                except PWTimeout:
+                    # No confirmation dialog — deletion may have gone through directly
+                    pass
+
+                await page.wait_for_timeout(1_000)
+                await shot(f"clear_after_{_pass}")
+                total_removed += 1
+                print(f"  Deleted.", flush=True)
+
+            return total_removed
+
+        except Exception as exc:
+            p = BASE_DIR / "debug_clear_error.png"
+            await page.screenshot(path=str(p), full_page=True)
+            print(f"\nError: {exc}", file=sys.stderr, flush=True)
+            print("Screenshot saved → debug_clear_error.png", file=sys.stderr, flush=True)
+            raise
+        finally:
+            await browser.close()
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -805,6 +1051,9 @@ def main() -> None:
                         default="Lunch",
                         choices=["Breakfast", "Lunch", "Dinner", "Snacks"],
                         help="Diary section to log into (default: Lunch)")
+    parser.add_argument("--clear-section",
+                        metavar="SECTION",
+                        help="Delete all entries from this diary section and exit")
     parser.add_argument("--portion",
                         default="normal",
                         choices=list(PORTION_SCALE.keys()),
@@ -812,6 +1061,22 @@ def main() -> None:
     parser.add_argument("--nutrition-from-stdin", action="store_true",
                         help="Read ingredient JSON from stdin (used by add_meal.sh)")
     args = parser.parse_args()
+
+    # ── Clear-section mode ────────────────────────────────────────────────────
+    if args.clear_section:
+        username, password = load_credentials()
+        try:
+            removed = asyncio.run(cronometer_clear_section(
+                username, password,
+                section=args.clear_section,
+                log_date=args.date,
+                debug=args.debug,
+            ))
+        except Exception as exc:
+            print(f"\nClear failed: {exc}", file=sys.stderr, flush=True)
+            sys.exit(1)
+        print(f"\n✓  Removed {removed} entry/entries from {args.clear_section} on {args.date}.", flush=True)
+        return
 
     # ── Docker mode: JSON piped in from add_meal.sh ───────────────────────────
     if args.nutrition_from_stdin:
