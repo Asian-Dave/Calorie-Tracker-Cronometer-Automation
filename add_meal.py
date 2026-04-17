@@ -557,76 +557,72 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
             print(f"    (Diary group dropdown not found, skipping)", flush=True)
 
         # ── Serving quantity ────────────────────────────────────────────────
-        # Read the current serving button text (ignoring the diary-group button).
-        current_serving = await page.evaluate("""() => {
-            return Array.from(document.querySelectorAll('button.dropdown-btn.dropdown-toggle'))
-                .filter(b => b.offsetParent !== null &&
-                        !(b.getAttribute('aria-labelledby') || '').includes('diaryGroup'))
-                .map(b => b.innerText.trim())[0] ?? null;
-        }""")
+        # Strategy: always open the serving dropdown, prefer the pure "g" option
+        # (1 g/unit → enter target_g directly). Fall back to any gram-labelled option
+        # (calculate ratio). If no gram option at all, keep qty=1.
 
         qty_val = "1"
-        if current_serving:
-            gm = re.search(r"(\d+(?:\.\d+)?)\s*g\b", current_serving)
-            if gm:
-                # Button already shows grams (e.g. "cup — 165g") → calculate ratio
-                qty_val = f"{target_g / float(gm.group(1)):.2f}"
-                print(f"    Serving: {current_serving!r} → qty={qty_val}", flush=True)
-            else:
-                # Open the dropdown to find a gram-based option
-                await page.evaluate("""() => {
-                    Array.from(document.querySelectorAll('button.dropdown-btn.dropdown-toggle'))
-                        .filter(b => b.offsetParent !== null &&
-                                !(b.getAttribute('aria-labelledby') || '').includes('diaryGroup'))
-                        [0]?.click();
-                }""")
-                await page.wait_for_timeout(500)
 
-                # Collect all visible dropdown items and their texts
-                dropdown_texts = await page.evaluate("""() => {
-                    return Array.from(document.querySelectorAll('.dropdown-item'))
-                        .filter(e => e.offsetParent !== null)
-                        .map(e => e.innerText.trim());
-                }""")
+        # Open the serving dropdown and capture the current label
+        current_serving = await page.evaluate("""() => {
+            const btns = Array.from(document.querySelectorAll('button.dropdown-btn.dropdown-toggle'))
+                .filter(b => b.offsetParent !== null &&
+                        !(b.getAttribute('aria-labelledby') || '').includes('diaryGroup'));
+            if (btns[0]) { btns[0].click(); return btns[0].innerText.trim(); }
+            return null;
+        }""")
+        await page.wait_for_timeout(600)
 
-                # Prefer exact 'g' unit; otherwise first option with a gram number
-                chosen_text = None
-                chosen_g = None
-                for opt in dropdown_texts:
-                    if opt.lower() == 'g':
-                        chosen_text, chosen_g = opt, 1.0
+        if current_serving is not None:
+            dropdown_items = await page.evaluate("""() => {
+                return Array.from(document.querySelectorAll('.dropdown-item'))
+                    .filter(e => e.offsetParent !== null)
+                    .map(e => e.innerText.trim());
+            }""")
+            print(f"    Serving: {current_serving!r} | options: {dropdown_items[:6]}", flush=True)
+
+            # Prefer exact "g" unit (1 g each); otherwise first option that names a gram weight
+            chosen_text = None
+            chosen_g = None
+            for opt in dropdown_items:
+                if re.fullmatch(r'\s*g\s*', opt, re.IGNORECASE):
+                    chosen_text, chosen_g = opt, 1.0
+                    break
+            if chosen_text is None:
+                for opt in dropdown_items:
+                    m = re.search(r"(\d+(?:\.\d+)?)\s*g\b", opt)
+                    if m:
+                        chosen_text, chosen_g = opt, float(m.group(1))
                         break
-                if chosen_text is None:
-                    for opt in dropdown_texts:
-                        gm2 = re.search(r"(\d+(?:\.\d+)?)\s*g\b", opt)
-                        if gm2:
-                            chosen_text, chosen_g = opt, float(gm2.group(1))
-                            break
 
-                if chosen_text and chosen_g:
-                    # Use Playwright force-click so Bootstrap registers the selection
-                    try:
-                        item_loc = page.locator('.dropdown-item').filter(
-                            has_text=re.compile(r'^\s*' + re.escape(chosen_text) + r'\s*$')
-                        ).first
-                        await item_loc.click(force=True, timeout=3_000)
-                        await page.wait_for_timeout(300)
-                        qty_val = (f"{target_g:.1f}" if chosen_g == 1.0
-                                   else f"{target_g / chosen_g:.2f}")
-                        print(f"    Serving: {chosen_text!r} selected → qty={qty_val}", flush=True)
-                    except PWTimeout:
-                        await page.keyboard.press("Escape")
-                        print(f"    Serving: dropdown click failed, qty=1", flush=True)
-                else:
+            if chosen_text and chosen_g:
+                try:
+                    item_loc = page.locator('.dropdown-item').filter(
+                        has_text=re.compile(r'^\s*' + re.escape(chosen_text) + r'\s*$')
+                    ).first
+                    await item_loc.click(force=True, timeout=3_000)
+                    await page.wait_for_timeout(800)  # let GWT re-render the qty field
+                    qty_val = (f"{target_g:.1f}" if chosen_g == 1.0
+                               else f"{target_g / chosen_g:.2f}")
+                    print(f"    Unit → {chosen_text!r}, qty={qty_val}", flush=True)
+                except PWTimeout:
                     await page.keyboard.press("Escape")
-                    print(f"    Serving: no gram option (options: {dropdown_texts[:4]}), qty=1",
-                          flush=True)
-                await page.wait_for_timeout(200)
+                    print(f"    Dropdown click failed, qty=1", flush=True)
+            else:
+                # No gram option in list — check if current label already encodes grams
+                gm = re.search(r"(\d+(?:\.\d+)?)\s*g\b", current_serving)
+                if gm:
+                    qty_val = f"{target_g / float(gm.group(1)):.2f}"
+                    print(f"    No gram unit; ratio from label → qty={qty_val}", flush=True)
+                else:
+                    print(f"    No gram option found, qty=1", flush=True)
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(300)
+        else:
+            print(f"    Serving dropdown not found, qty=1", flush=True)
 
-        # Write the quantity using Playwright keyboard input so GWT's event
-        # handlers fire (JS value assignment alone doesn't update GWT's model).
-        # Broaden selector: look at ALL visible text inputs, not just gwt-TextBox,
-        # excluding the food search box (identified by its placeholder).
+        # Find the qty input: last visible input that is not the food search box.
+        # Do NOT filter by current value — it may be empty or "1" after a unit switch.
         qty_debug = await page.evaluate("""() => {
             const all = Array.from(document.querySelectorAll('input'));
             return all.filter(e => e.offsetParent !== null).map(e => ({
@@ -637,19 +633,18 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
         qty_input_idx = await page.evaluate("""() => {
             const all = Array.from(document.querySelectorAll('input'));
             const vis = all.filter(e => e.offsetParent !== null
-                                    && !e.placeholder?.toLowerCase().includes('search')
-                                    && /^[\d.]+$/.test(e.value?.trim()));
+                                    && !e.placeholder?.toLowerCase().includes('search'));
             const inp = vis[vis.length - 1];
             return inp ? all.indexOf(inp) : -1;
         }""")
         if qty_input_idx >= 0:
             qty_loc = page.locator('input').nth(qty_input_idx)
             await qty_loc.scroll_into_view_if_needed(timeout=2_000)
-            await qty_loc.click(force=True)
-            await page.keyboard.press("Control+a")
+            await qty_loc.click(click_count=3)    # triple-click selects existing value
             await qty_loc.press_sequentially(qty_val, delay=40)
-            await qty_loc.press("Tab")   # blur → GWT commits the value
-            await page.wait_for_timeout(500)
+            await qty_loc.press("Tab")            # blur → GWT commits the value
+            await page.wait_for_timeout(600)
+            print(f"    Set qty={qty_val}", flush=True)
         else:
             print(f"    Warning: qty input not found", flush=True)
 
