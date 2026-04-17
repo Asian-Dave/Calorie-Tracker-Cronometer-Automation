@@ -127,7 +127,8 @@ fi
 echo ""
 echo "Estimating nutrition for: ${FOOD_DESCRIPTION:0:80}..."
 
-TMPJSON=$(mktemp /tmp/meal_nutrition_XXXXXX.json)
+TMPJSON="/tmp/meal_nutrition_$$.json"
+rm -f "$TMPJSON"
 trap 'rm -f "$TMPJSON"' EXIT
 
 PORTION_NOTE="Portion size: normal (standard canteen serving)."
@@ -173,10 +174,42 @@ PYEOF
 
 [[ "$ESTIMATE_ONLY" == "true" ]] && exit 0
 
-# ── Confirm ────────────────────────────────────────────────────────────────────
-read -rp $"\nLog this to Cronometer for ${LOG_DATE}? [Y/n]: " CONFIRM < /dev/tty
+# ── Confirm (or scale) ─────────────────────────────────────────────────────────
+TOTAL_CALS=$(python3 -c "import json; d=json.load(open('$TMPJSON')); print(sum(int(i['calories']) for i in d['ingredients']))")
+echo ""
+read -rp "Log this (${TOTAL_CALS} kcal) to Cronometer for ${LOG_DATE}? [Y/n/<target kcal>]: " CONFIRM < /dev/tty
 CONFIRM="${CONFIRM:-y}"
 [[ "$CONFIRM" =~ ^[Nn] ]] && { echo "Aborted."; exit 0; }
+
+# ── Optional calorie scaling ───────────────────────────────────────────────────
+# If the user typed a number, scale all ingredient amounts proportionally to
+# reach that calorie target (useful when the AI estimate feels too low/high).
+if [[ "$CONFIRM" =~ ^[0-9]+$ ]]; then
+    TMPJSON_SCALED="${TMPJSON%.json}_scaled.json"
+    trap 'rm -f "$TMPJSON" "$TMPJSON_SCALED"' EXIT
+    python3 -c "
+import json, sys
+target = int(sys.argv[1])
+with open(sys.argv[2]) as f:
+    d = json.load(f)
+total = sum(i['calories'] for i in d['ingredients'])
+if total > 0:
+    s = target / total
+    for i in d['ingredients']:
+        i['amount_g']   = round(i['amount_g']   * s, 1)
+        i['calories']   = round(i['calories']    * s)
+        i['protein_g']  = round(i['protein_g']   * s, 1)
+        i['fat_g']      = round(i['fat_g']        * s, 1)
+        i['carbs_g']    = round(i['carbs_g']      * s, 1)
+        i['fiber_g']    = round(i['fiber_g']      * s, 1)
+        i['sugar_g']    = round(i['sugar_g']      * s, 1)
+        i['sodium_mg']  = round(i['sodium_mg']    * s)
+with open(sys.argv[3], 'w') as f:
+    json.dump(d, f)
+" "$CONFIRM" "$TMPJSON" "$TMPJSON_SCALED"
+    echo "  Scaled: ${TOTAL_CALS} → ${CONFIRM} kcal (factor $(python3 -c "print(f'{$CONFIRM/$TOTAL_CALS:.2f}')") )"
+    TMPJSON="$TMPJSON_SCALED"
+fi
 
 # ── Hand off to Docker for Playwright automation ───────────────────────────────
 # -T disables TTY allocation (piping stdin); the container reads the JSON and

@@ -470,7 +470,11 @@ async def _search_and_pick(page: Page, search_term: str) -> bool:
     await page.evaluate("() => document.querySelector('button.food-search-btn')?.click()")
     await page.wait_for_timeout(2_500)
     keyword = search_term.split()[0]
-    return await page.locator(f'td:has-text("{keyword}")').count() > 0
+    # Scope to the search dialog so diary entries don't produce false positives
+    dialog = page.locator(
+        '.pretty-dialog:has(input[placeholder="Search all foods & recipes..."])'
+    ).first
+    return await dialog.locator(f'td:has-text("{keyword}")').count() > 0
 
 
 async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_section: str = "Lunch") -> None:
@@ -501,8 +505,13 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
         await page.wait_for_timeout(600)
 
         # Use Playwright's CDP force-click (real mouse events via DevTools Protocol).
-        # JS dispatchEvent does NOT reliably trigger GWT's event handlers — only CDP does.
-        # Try selectors in preference order; the first one that resolves to ≥1 element wins.
+        # IMPORTANT: scope every selector to the search dialog so we never
+        # accidentally click a diary entry with the same text.
+        # The dialog is the .pretty-dialog that contains the search input.
+        dialog = page.locator(
+            '.pretty-dialog:has(input[placeholder="Search all foods & recipes..."])'
+        ).first
+
         click_succeeded = False
         for sel in [
             f'td.no-left-padding:has-text("{keyword}")',
@@ -510,7 +519,7 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
             f'td:has-text("{keyword}")',
         ]:
             try:
-                loc = page.locator(sel).first
+                loc = dialog.locator(sel).first
                 if await loc.count() == 0:
                     continue
                 await loc.scroll_into_view_if_needed(timeout=2_000)
@@ -523,7 +532,13 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
         if not click_succeeded:
             print(f"    Warning: could not click result row for {found_term!r}.", flush=True)
 
-        await page.wait_for_timeout(1_800)
+        # Wait for the food detail panel to appear (Add to Diary button is the signal)
+        try:
+            await page.locator('button.btn-flat-jungle-green:has-text("Add to Diary")').first.wait_for(
+                state="visible", timeout=6_000
+            )
+        except PWTimeout:
+            await page.wait_for_timeout(1_800)
         await _dismiss_popups(page)  # remove any popup that appeared after click
         await shot(f"ing{idx}_selected")
 
@@ -542,30 +557,101 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
             print(f"    (Diary group dropdown not found, skipping)", flush=True)
 
         # ── Serving quantity ────────────────────────────────────────────────
-        serving_text = await page.evaluate("""() => {
-            const btns = Array.from(document.querySelectorAll('button.dropdown-btn.dropdown-toggle'));
-            const s = btns.find(b => /\\d+\\s*g/.test(b.innerText));
-            return s ? s.innerText.trim() : null;
+        # Read the current serving button text (ignoring the diary-group button).
+        current_serving = await page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('button.dropdown-btn.dropdown-toggle'))
+                .filter(b => b.offsetParent !== null &&
+                        !(b.getAttribute('aria-labelledby') || '').includes('diaryGroup'))
+                .map(b => b.innerText.trim())[0] ?? null;
         }""")
+
         qty_val = "1"
-        if serving_text:
-            m = re.search(r"(\d+(?:\.\d+)?)\s*g\b", serving_text)
-            if m:
-                serving_g = float(m.group(1))
-                qty_val = f"{target_g / serving_g:.2f}"
-                print(f"    Serving: {serving_text!r} → qty={qty_val}", flush=True)
-        # Set qty via JS (the input has no name/id, only its numeric value distinguishes it)
-        await page.evaluate(f"""() => {{
-            const inputs = Array.from(document.querySelectorAll('input.gwt-TextBox'))
-                .filter(e => e.offsetParent !== null && /^[\\d.]+$/.test(e.value?.trim()));
-            if (inputs.length) {{
-                const inp = inputs[inputs.length - 1];
-                inp.value = {json.dumps(qty_val)};
-                inp.dispatchEvent(new Event('input', {{bubbles:true}}));
-                inp.dispatchEvent(new Event('change', {{bubbles:true}}));
-            }}
-        }}""")
-        await page.wait_for_timeout(300)
+        if current_serving:
+            gm = re.search(r"(\d+(?:\.\d+)?)\s*g\b", current_serving)
+            if gm:
+                # Button already shows grams (e.g. "cup — 165g") → calculate ratio
+                qty_val = f"{target_g / float(gm.group(1)):.2f}"
+                print(f"    Serving: {current_serving!r} → qty={qty_val}", flush=True)
+            else:
+                # Open the dropdown to find a gram-based option
+                await page.evaluate("""() => {
+                    Array.from(document.querySelectorAll('button.dropdown-btn.dropdown-toggle'))
+                        .filter(b => b.offsetParent !== null &&
+                                !(b.getAttribute('aria-labelledby') || '').includes('diaryGroup'))
+                        [0]?.click();
+                }""")
+                await page.wait_for_timeout(500)
+
+                # Collect all visible dropdown items and their texts
+                dropdown_texts = await page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll('.dropdown-item'))
+                        .filter(e => e.offsetParent !== null)
+                        .map(e => e.innerText.trim());
+                }""")
+
+                # Prefer exact 'g' unit; otherwise first option with a gram number
+                chosen_text = None
+                chosen_g = None
+                for opt in dropdown_texts:
+                    if opt.lower() == 'g':
+                        chosen_text, chosen_g = opt, 1.0
+                        break
+                if chosen_text is None:
+                    for opt in dropdown_texts:
+                        gm2 = re.search(r"(\d+(?:\.\d+)?)\s*g\b", opt)
+                        if gm2:
+                            chosen_text, chosen_g = opt, float(gm2.group(1))
+                            break
+
+                if chosen_text and chosen_g:
+                    # Use Playwright force-click so Bootstrap registers the selection
+                    try:
+                        item_loc = page.locator('.dropdown-item').filter(
+                            has_text=re.compile(r'^\s*' + re.escape(chosen_text) + r'\s*$')
+                        ).first
+                        await item_loc.click(force=True, timeout=3_000)
+                        await page.wait_for_timeout(300)
+                        qty_val = (f"{target_g:.1f}" if chosen_g == 1.0
+                                   else f"{target_g / chosen_g:.2f}")
+                        print(f"    Serving: {chosen_text!r} selected → qty={qty_val}", flush=True)
+                    except PWTimeout:
+                        await page.keyboard.press("Escape")
+                        print(f"    Serving: dropdown click failed, qty=1", flush=True)
+                else:
+                    await page.keyboard.press("Escape")
+                    print(f"    Serving: no gram option (options: {dropdown_texts[:4]}), qty=1",
+                          flush=True)
+                await page.wait_for_timeout(200)
+
+        # Write the quantity using Playwright keyboard input so GWT's event
+        # handlers fire (JS value assignment alone doesn't update GWT's model).
+        # Broaden selector: look at ALL visible text inputs, not just gwt-TextBox,
+        # excluding the food search box (identified by its placeholder).
+        qty_debug = await page.evaluate("""() => {
+            const all = Array.from(document.querySelectorAll('input'));
+            return all.filter(e => e.offsetParent !== null).map(e => ({
+                cls: e.className, v: e.value, ph: e.placeholder, type: e.type
+            }));
+        }""")
+        print(f"    DBG inputs: {qty_debug}", flush=True)
+        qty_input_idx = await page.evaluate("""() => {
+            const all = Array.from(document.querySelectorAll('input'));
+            const vis = all.filter(e => e.offsetParent !== null
+                                    && !e.placeholder?.toLowerCase().includes('search')
+                                    && /^[\d.]+$/.test(e.value?.trim()));
+            const inp = vis[vis.length - 1];
+            return inp ? all.indexOf(inp) : -1;
+        }""")
+        if qty_input_idx >= 0:
+            qty_loc = page.locator('input').nth(qty_input_idx)
+            await qty_loc.scroll_into_view_if_needed(timeout=2_000)
+            await qty_loc.click(force=True)
+            await page.keyboard.press("Control+a")
+            await qty_loc.press_sequentially(qty_val, delay=40)
+            await qty_loc.press("Tab")   # blur → GWT commits the value
+            await page.wait_for_timeout(500)
+        else:
+            print(f"    Warning: qty input not found", flush=True)
 
         # ── ADD TO DIARY ────────────────────────────────────────────────────
         # The button DOM text is "Add to Diary"; has-text is case-insensitive.
