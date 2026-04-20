@@ -692,21 +692,44 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
                     await page.keyboard.press("Escape")
                     print(f"    Dropdown click failed", flush=True)
             else:
-                # No gram option — fall back to ratio from current serving label
-                gm = re.search(r"(\d+(?:\.\d+)?)\s*g\b", current_serving)
+                # No gram option — select the first available unit (do NOT press Escape,
+                # which would close the entire food dialog, not just the dropdown).
+                # Then estimate qty from the serving label's weight (g or ml).
+                if dropdown_items:
+                    try:
+                        first_item = page.locator('.dropdown-item').filter(
+                            has_text=re.compile(r'^\s*' + re.escape(dropdown_items[0]) + r'\s*$')
+                        ).first
+                        await first_item.click(force=True, timeout=3_000)
+                        await page.wait_for_timeout(500)
+                        serving_label = dropdown_items[0]
+                    except PWTimeout:
+                        await page.keyboard.press("Escape")
+                        await page.wait_for_timeout(300)
+                        serving_label = current_serving
+                else:
+                    await page.keyboard.press("Escape")
+                    await page.wait_for_timeout(300)
+                    serving_label = current_serving
+
+                # Try to parse gram weight from label: prefer explicit 'g', then treat ml as g
+                gm = re.search(r"(\d+(?:\.\d+)?)\s*g\b", serving_label)
                 if gm:
                     qty_val = f"{target_g / float(gm.group(1)):.2f}"
-                await page.keyboard.press("Escape")
-                await page.wait_for_timeout(300)
+                else:
+                    ml = re.search(r"(\d+(?:\.\d+)?)\s*ml\b", serving_label, re.IGNORECASE)
+                    if ml:
+                        qty_val = f"{target_g / float(ml.group(1)):.2f}"
                 print(f"    No gram unit (options: {dropdown_items[:4]}), qty={qty_val}", flush=True)
         else:
             print(f"    Serving dropdown not found", flush=True)
 
-        # Find the qty input: last visible input that is not the food search box
+        # Find the qty input: last visible, interactive input that is not the food search box
         qty_input_idx = await page.evaluate("""() => {
             const all = Array.from(document.querySelectorAll('input'));
             const vis = all.filter(e => e.offsetParent !== null
-                                    && !e.placeholder?.toLowerCase().includes('search'));
+                                    && !e.placeholder?.toLowerCase().includes('search')
+                                    && e.getAttribute('aria-hidden') !== 'true');
             const inp = vis[vis.length - 1];
             return inp ? all.indexOf(inp) : -1;
         }""")
@@ -720,7 +743,7 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
                 # Enter 100g as a reference quantity, read what Cronometer shows for
                 # 100g (avoids rounding-to-zero issues with 1g), then compute the
                 # gram amount that matches the AI calorie estimate exactly.
-                await qty_loc.click(click_count=3)
+                await qty_loc.click(click_count=3, force=True)
                 await qty_loc.press_sequentially("100", delay=40)
                 await qty_loc.press("Tab")
                 await page.wait_for_timeout(700)
@@ -773,7 +796,7 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
                     qty_val = str(target_g)
 
             # Enter the final quantity
-            await qty_loc.click(click_count=3)
+            await qty_loc.click(click_count=3, force=True)
             await qty_loc.press_sequentially(qty_val, delay=40)
             await qty_loc.press("Tab")
             await page.wait_for_timeout(600)
