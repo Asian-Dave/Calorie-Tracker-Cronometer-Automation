@@ -40,18 +40,26 @@ export CRONOMETER_USER CRONOMETER_PASSWORD
 
 LOG_DATE=$(date +%Y-%m-%d)
 SECTION="Lunch"
+SKIP_FIRST=""
+DELETE_COUNT=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --date)    LOG_DATE="$2"; shift 2 ;;
-        --section) SECTION="$2";  shift 2 ;;
-        *)         echo "Unknown flag: $1" >&2; exit 1 ;;
+        --date)         LOG_DATE="$2";    shift 2 ;;
+        --section)      SECTION="$2";     shift 2 ;;
+        --skip-first)   SKIP_FIRST="$2";  shift 2 ;;
+        --delete-count) DELETE_COUNT="$2"; shift 2 ;;
+        *)              echo "Unknown flag: $1" >&2; exit 1 ;;
     esac
 done
 
 echo "Clearing $SECTION entries for $LOG_DATE..."
 
+EXTRA_FLAGS=""
+[[ -n "$SKIP_FIRST"   ]] && EXTRA_FLAGS="$EXTRA_FLAGS --skip-first $SKIP_FIRST"
+[[ -n "$DELETE_COUNT" ]] && EXTRA_FLAGS="$EXTRA_FLAGS --delete-count $DELETE_COUNT"
+
 docker compose run --rm -T \
     -e CRONOMETER_USER="$CRONOMETER_USER" \
     -e CRONOMETER_PASSWORD="$CRONOMETER_PASSWORD" \
-    calorie-tracker --clear-section "$SECTION" --date "$LOG_DATE" --debug
+    calorie-tracker --clear-section "$SECTION" --date "$LOG_DATE" --debug $EXTRA_FLAGS

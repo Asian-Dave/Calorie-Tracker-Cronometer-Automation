@@ -227,26 +227,34 @@ docker compose run --rm \
     -e CRONOMETER_PASSWORD="$CRONOMETER_PASSWORD" \
     calorie-tracker $DOCKER_FLAGS
 
-# ── Adjustment flow (runs on host so claude CLI is available) ─────────────────
+# ── Adjustment loop (runs on host so claude CLI is available) ─────────────────
 if [[ ! -f "$KCAL_FILE" ]]; then exit 0; fi
 
-TOTAL=$(python3 -c "import json; d=json.load(open('$KCAL_FILE')); print(d['total_cronometer'])")
-echo ""
-read -rp "Adjust? Enter target kcal or press Enter to skip [${TOTAL} kcal logged]: " ADJUST < /dev/tty
-ADJUST="${ADJUST:-}"
-[[ ! "$ADJUST" =~ ^[0-9]+$ ]] && exit 0
+_read_kcal_file() {
+    TOTAL=$(python3 -c "import json; d=json.load(open('$KCAL_FILE')); print(d['total_cronometer'])")
+    ITEMS_BEFORE=$(python3 -c "import json; d=json.load(open('$KCAL_FILE')); print(d['items_before'])")
+    ITEMS_ADDED=$(python3 -c "import json; d=json.load(open('$KCAL_FILE')); print(len(d['ingredients']))")
+}
 
-echo ""
-echo "Asking Claude for adjustments (${TOTAL} → ${ADJUST} kcal)…"
+_read_kcal_file
 
-ING_SUMMARY=$(python3 -c "
+while true; do
+    echo ""
+    read -rp "Adjust? Enter target kcal or press Enter to finish [${TOTAL} kcal logged]: " ADJUST < /dev/tty
+    ADJUST="${ADJUST:-}"
+    [[ ! "$ADJUST" =~ ^[0-9]+$ ]] && { echo "Done."; break; }
+
+    echo ""
+    echo "Asking Claude for adjustments (${TOTAL} → ${ADJUST} kcal)…"
+
+    ING_SUMMARY=$(python3 -c "
 import json
 d = json.load(open('$KCAL_FILE'))
 for i in d['ingredients']:
     print(f\"  {i['search_name']}: {i['amount_g']}g, logged approx {i['cronometer_kcal']} kcal\")
 ")
 
-ADJUSTED_JSON=$(claude -p "You are a registered dietitian. A user tracked a meal in Cronometer.
+    ADJUSTED_JSON=$(claude -p "You are a registered dietitian. A user tracked a meal in Cronometer.
 Cronometer recorded ${TOTAL} kcal total; the user's target is ${ADJUST} kcal.
 
 Current ingredients (gram amounts and kcal as recorded by Cronometer):
@@ -257,9 +265,9 @@ Keep each ingredient at least 5g. Recalculate all macros proportionally.
 Reply with ONLY a valid JSON object in this exact format, no explanation:
 {\"meal_name\":\"<name>\",\"ingredients\":[{\"search_name\":\"...\",\"amount_g\":<n>,\"calories\":<n>,\"protein_g\":<n>,\"fat_g\":<n>,\"carbs_g\":<n>,\"fiber_g\":<n>,\"sugar_g\":<n>,\"sodium_mg\":<n>}]}" </dev/null)
 
-echo "$ADJUSTED_JSON" > "$ADJUSTED_FILE"
+    echo "$ADJUSTED_JSON" > "$ADJUSTED_FILE"
 
-python3 - "$ADJUSTED_FILE" <<'PYEOF'
+    python3 - "$ADJUSTED_FILE" <<'PYEOF'
 import json, re, sys
 with open(sys.argv[1]) as f:
     text = f.read().strip()
@@ -282,18 +290,29 @@ print(f"│  {'TOTAL':<31} │{total:>6} │{'':>6} │{'':>6} │{'':>6} │{''
 print(f"└{'─'*34}┴{'─'*7}┴{'─'*7}┴{'─'*7}┴{'─'*7}┴{'─'*6}┘")
 PYEOF
 
-echo ""
-read -rp "Apply these adjustments? This will clear ${MEAL_SECTION} and re-add. [Y/n]: " APPLY < /dev/tty
-APPLY="${APPLY:-y}"
-[[ "$APPLY" =~ ^[Nn] ]] && { echo "Adjustment cancelled."; exit 0; }
+    echo ""
+    read -rp "Apply these adjustments? This will replace the ${ITEMS_ADDED} items we added. [Y/n]: " APPLY < /dev/tty
+    APPLY="${APPLY:-y}"
+    if [[ "$APPLY" =~ ^[Nn] ]]; then
+        echo "Adjustment cancelled. Keeping current entries."
+        continue
+    fi
 
-echo ""
-echo "Clearing ${MEAL_SECTION}…"
-bash "$SCRIPT_DIR/clear_diary.sh" --date "$LOG_DATE" --section "$MEAL_SECTION"
+    echo ""
+    echo "Clearing the ${ITEMS_ADDED} items we added to ${MEAL_SECTION}…"
+    bash "$SCRIPT_DIR/clear_diary.sh" --date "$LOG_DATE" --section "$MEAL_SECTION" \
+        --skip-first "$ITEMS_BEFORE" --delete-count "$ITEMS_ADDED"
 
-cp "$ADJUSTED_FILE" "$MEAL_INPUT"
-echo "Re-adding adjusted ingredients…"
-docker compose run --rm \
-    -e CRONOMETER_USER="$CRONOMETER_USER" \
-    -e CRONOMETER_PASSWORD="$CRONOMETER_PASSWORD" \
-    calorie-tracker $DOCKER_FLAGS
+    cp "$ADJUSTED_FILE" "$MEAL_INPUT"
+    echo "Re-adding adjusted ingredients…"
+    docker compose run --rm \
+        -e CRONOMETER_USER="$CRONOMETER_USER" \
+        -e CRONOMETER_PASSWORD="$CRONOMETER_PASSWORD" \
+        calorie-tracker $DOCKER_FLAGS
+
+    if [[ ! -f "$KCAL_FILE" ]]; then
+        echo "Warning: no kcal file written after re-add; exiting loop."
+        break
+    fi
+    _read_kcal_file
+done

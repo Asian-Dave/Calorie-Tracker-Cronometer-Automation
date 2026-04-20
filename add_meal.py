@@ -126,7 +126,7 @@ async def cronometer_add(
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=not visible,
-            args=["--disable-dev-shm-usage"],
+            args=["--disable-dev-shm-usage", "--disable-gpu"],
         )
         ctx_kwargs: dict = {"viewport": {"width": 1280, "height": 900}, "locale": "en-US"}
         if SESSION_FILE.exists():
@@ -151,6 +151,7 @@ async def cronometer_add(
             await shot("2_diary")
 
             ingredients = data["ingredients"]
+            items_before = await _count_section_items(page, meal_section)
             kcal_list: list[float] = []
             for idx, ing in enumerate(ingredients):
                 print(f"\n  [{idx+1}/{len(ingredients)}] {ing['search_name']} ({ing['amount_g']}g, {ing['calories']} kcal)", flush=True)
@@ -171,7 +172,7 @@ async def cronometer_add(
                     f.unlink(missing_ok=True)
 
             # Use actual diary values for the adjustment flow when available
-            return data, diary_kcals if diary_kcals else kcal_list
+            return data, diary_kcals if diary_kcals else kcal_list, items_before
 
         except Exception as exc:
             # Always save an error screenshot regardless of debug flag
@@ -923,6 +924,27 @@ async def _create_custom_food(page: Page, ing: dict, shot, idx: int) -> None:
         print(f"    Custom food added.", flush=True)
 
 
+async def _count_section_items(page: Page, section: str) -> int:
+    """Return the number of food rows currently in a diary section."""
+    return await page.evaluate(f"""() => {{
+        const ALL_SECTIONS = ['Uncategorized','Breakfast','Lunch','Dinner','Snacks'];
+        const target = {json.dumps(section)};
+        let inSection = false, count = 0;
+        for (const tr of document.querySelectorAll('tr')) {{
+            if (!tr.offsetParent) continue;
+            if (!tr.querySelector('.icon-food')) {{
+                const txt = (tr.innerText || '').trim();
+                for (const s of ALL_SECTIONS) {{
+                    if (txt.startsWith(s)) {{ inSection = s === target; break; }}
+                }}
+                continue;
+            }}
+            if (inSection) count++;
+        }}
+        return count;
+    }}""")
+
+
 async def _dump_diary_debug(page: Page, base_dir: Path) -> None:
     """Save diary HTML + screenshot for DOM debugging."""
     (base_dir / "debug_diary.html").write_text(await page.content(), encoding="utf-8")
@@ -1095,7 +1117,7 @@ def _run_adjustment_flow(
         asyncio.run(cronometer_add(
             username, password, adjusted, log_date,
             visible=visible, debug=debug, meal_section=section,
-        ))
+        ))  # return value unused here
     except Exception as exc:
         print(f"Re-add failed: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -1107,12 +1129,18 @@ async def cronometer_clear_section(
     section: str,
     log_date: str,
     debug: bool = False,
+    skip_first: int = 0,
+    delete_count: int | None = None,
 ) -> int:
-    """Remove all food entries from a diary section. Returns number of entries removed."""
+    """Remove food entries from a diary section. Returns number of entries removed.
+
+    skip_first: leave the first N items untouched (items from other meals).
+    delete_count: remove at most this many items (None = all after skip_first).
+    """
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--disable-dev-shm-usage"],
+            args=["--disable-dev-shm-usage", "--disable-gpu"],
         )
         ctx_kwargs: dict = {"viewport": {"width": 1280, "height": 900}, "locale": "en-US"}
         if SESSION_FILE.exists():
@@ -1135,15 +1163,16 @@ async def cronometer_clear_section(
 
             total_removed = 0
 
-            for _pass in range(30):  # safety cap
-                # Return the actual DOM element so we can scroll it into view and
-                # get fresh viewport coordinates — items below the fold have
-                # getBoundingClientRect().y > viewport height, and mouse.click at
-                # off-screen coordinates silently does nothing in Playwright.
+            cap = (delete_count if delete_count is not None else 30) + 1
+            for _pass in range(cap):  # safety cap
+                if delete_count is not None and total_removed >= delete_count:
+                    break
+                # Return the (skip_first+1)th food item in the section —
+                # as we delete one at a time, items above skip_first stay put.
                 handle = await page.evaluate_handle(f"""() => {{
                     const ALL_SECTIONS = ['Uncategorized','Breakfast','Lunch','Dinner','Snacks'];
                     const target = {json.dumps(section)};
-                    let inSection = false;
+                    let inSection = false, foodCount = 0;
 
                     for (const tr of document.querySelectorAll('tr')) {{
                         if (!tr.offsetParent) continue;
@@ -1157,8 +1186,10 @@ async def cronometer_clear_section(
                         }}
 
                         if (!inSection) continue;
+                        foodCount++;
+                        if (foodCount <= {skip_first}) continue;
 
-                        // Prefer the food-name cell; fall back to full row
+                        // This is the first deletable item — return its clickable cell
                         return tr.querySelector('td.no-left-padding')
                             || tr.querySelector('td[align="left"]')
                             || tr;
@@ -1286,6 +1317,10 @@ def main() -> None:
     parser.add_argument("--clear-section",
                         metavar="SECTION",
                         help="Delete all entries from this diary section and exit")
+    parser.add_argument("--skip-first", type=int, default=0,
+                        help="With --clear-section: leave the first N items untouched")
+    parser.add_argument("--delete-count", type=int, default=None,
+                        help="With --clear-section: delete at most N items")
     parser.add_argument("--portion",
                         default="normal",
                         choices=list(PORTION_SCALE.keys()),
@@ -1305,6 +1340,8 @@ def main() -> None:
                 section=args.clear_section,
                 log_date=args.date,
                 debug=args.debug,
+                skip_first=args.skip_first,
+                delete_count=args.delete_count,
             ))
         except Exception as exc:
             print(f"\nClear failed: {exc}", file=sys.stderr, flush=True)
@@ -1330,7 +1367,7 @@ def main() -> None:
         username, password = load_credentials()
         print("Starting Playwright automation…", flush=True)
         try:
-            data_out, kcal_list = asyncio.run(cronometer_add(
+            data_out, kcal_list, items_before = asyncio.run(cronometer_add(
                 username, password, data, args.date,
                 visible=False, debug=args.debug, meal_section=args.section,
             ))
@@ -1346,6 +1383,7 @@ def main() -> None:
                 for ing, k in zip(data_out["ingredients"], kcal_list)
             ],
             "total_cronometer": int(sum(kcal_list)),
+            "items_before": items_before,
         }
         (BASE_DIR / ".last_logged_kcals.json").write_text(json.dumps(kcal_output))
         return
@@ -1364,7 +1402,7 @@ def main() -> None:
         username, password = load_credentials()
         print("Starting Playwright automation…", flush=True)
         try:
-            data_out, kcal_list = asyncio.run(cronometer_add(
+            data_out, kcal_list, _ = asyncio.run(cronometer_add(
                 username, password, data, args.date,
                 visible=False, debug=args.debug, meal_section=args.section,
             ))
@@ -1416,7 +1454,7 @@ def main() -> None:
 
     username, password = load_credentials()
     try:
-        data_out, kcal_list = asyncio.run(cronometer_add(
+        data_out, kcal_list, _ = asyncio.run(cronometer_add(
             username, password, data, args.date,
             visible=args.visible, debug=args.debug, meal_section=args.section,
         ))
