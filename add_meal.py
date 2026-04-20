@@ -726,16 +726,33 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
                 await page.wait_for_timeout(700)
 
                 db_kcal_100 = await page.evaluate("""() => {
-                    // Anchor on the "Add to Diary" button to stay inside the food
-                    // detail panel — avoids reading calorie values from search rows.
-                    const addBtn = Array.from(document.querySelectorAll('button'))
+                    // Scope ENTIRELY to the food search dialog so we never read
+                    // the background diary's section totals (e.g. "1320 kcal").
+                    const dialog = document.querySelector(
+                        '.pretty-dialog:has(input[placeholder="Search all foods & recipes..."])'
+                    );
+                    if (!dialog) return null;
+
+                    // Strategy 1: find an element whose ENTIRE visible text is
+                    // "NNN kcal" — the food detail panel's standalone kcal display.
+                    for (const el of dialog.querySelectorAll('div,span,td,label,p')) {
+                        if (!el.offsetParent) continue;
+                        const text = (el.innerText || '').trim();
+                        const m = text.match(/^([0-9]{1,4})\\s*kcal$/i);
+                        if (m) {
+                            const n = parseInt(m[1]);
+                            if (n > 0 && n < 5000) return n;
+                        }
+                    }
+
+                    // Strategy 2: walk up from "Add to Diary" but stop at the
+                    // dialog boundary so we can never escape into the diary.
+                    const addBtn = Array.from(dialog.querySelectorAll('button'))
                         .find(b => b.offsetParent !== null
                                 && /add to diary/i.test(b.innerText?.trim()));
                     let el = addBtn?.parentElement;
-                    for (let i = 0; i < 8 && el; i++) {
+                    for (let i = 0; i < 6 && el && dialog.contains(el); i++) {
                         const t = el.innerText || '';
-                        // Match "NNN kcal" or "kcal NNN" — use [0-9] and \\s to avoid
-                        // Python interpreting \\d/\\b/\\n as escape sequences.
                         const m = t.match(/([0-9]{1,4})\\s*kcal/i)
                                || t.match(/kcal\\s*([0-9]{1,4})/i);
                         if (m) {
