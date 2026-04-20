@@ -1292,6 +1292,8 @@ def main() -> None:
                         help="Portion size hint (default: normal)")
     parser.add_argument("--nutrition-from-stdin", action="store_true",
                         help="Read ingredient JSON from stdin (used by add_meal.sh)")
+    parser.add_argument("--nutrition-from-file", metavar="PATH",
+                        help="Read ingredient JSON from file (used by add_meal.sh for interactive mode)")
     args = parser.parse_args()
 
     # ── Clear-section mode ────────────────────────────────────────────────────
@@ -1310,7 +1312,45 @@ def main() -> None:
         print(f"\n✓  Removed {removed} entry/entries from {args.clear_section} on {args.date}.", flush=True)
         return
 
-    # ── Docker mode: JSON piped in from add_meal.sh ───────────────────────────
+    # ── Docker mode: JSON from file (used by add_meal.sh) ────────────────────
+    if args.nutrition_from_file:
+        try:
+            raw = Path(args.nutrition_from_file).read_text().strip()
+        except OSError as exc:
+            print(f"Cannot read {args.nutrition_from_file}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if "```" in raw:
+            raw = re.sub(r"```\w*\n?", "", raw).strip()
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            print(f"Invalid JSON: {exc}", file=sys.stderr)
+            sys.exit(1)
+        display_breakdown(data)
+        username, password = load_credentials()
+        print("Starting Playwright automation…", flush=True)
+        try:
+            data_out, kcal_list = asyncio.run(cronometer_add(
+                username, password, data, args.date,
+                visible=False, debug=args.debug, meal_section=args.section,
+            ))
+        except Exception as exc:
+            print(f"\nAutomation failed: {exc}", file=sys.stderr, flush=True)
+            sys.exit(1)
+        # Write kcal results to mounted volume so add_meal.sh can run the
+        # adjustment flow on the host (where claude CLI is available).
+        kcal_output = {
+            "meal_name": data_out.get("meal_name", ""),
+            "ingredients": [
+                {**ing, "cronometer_kcal": int(k)}
+                for ing, k in zip(data_out["ingredients"], kcal_list)
+            ],
+            "total_cronometer": int(sum(kcal_list)),
+        }
+        (BASE_DIR / ".last_logged_kcals.json").write_text(json.dumps(kcal_output))
+        return
+
+    # ── Docker mode: JSON piped in from add_meal.sh (non-interactive) ─────────
     if args.nutrition_from_stdin:
         raw = sys.stdin.read().strip()
         if "```" in raw:
@@ -1331,11 +1371,6 @@ def main() -> None:
         except Exception as exc:
             print(f"\nAutomation failed: {exc}", file=sys.stderr, flush=True)
             sys.exit(1)
-        if sys.stdout.isatty():
-            _run_adjustment_flow(
-                data_out, kcal_list, username, password,
-                args.date, args.section, False, args.debug,
-            )
         return
 
     # ── Local mode: run Claude + Playwright directly on host ──────────────────

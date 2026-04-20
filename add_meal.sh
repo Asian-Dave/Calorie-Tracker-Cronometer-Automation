@@ -212,13 +212,88 @@ with open(sys.argv[3], 'w') as f:
 fi
 
 # ── Hand off to Docker for Playwright automation ───────────────────────────────
-# -T disables TTY allocation (piping stdin); the container reads the JSON and
-# runs Playwright headlessly — no interaction needed at this point.
-echo ""
-DOCKER_FLAGS="--nutrition-from-stdin --date $LOG_DATE --section $MEAL_SECTION"
-[[ "$DEBUG"   == "true" ]] && DOCKER_FLAGS="$DOCKER_FLAGS --debug"
+MEAL_INPUT="$SCRIPT_DIR/.meal_input.json"
+KCAL_FILE="$SCRIPT_DIR/.last_logged_kcals.json"
+ADJUSTED_FILE="$SCRIPT_DIR/.adjusted_meal.json"
+cp "$TMPJSON" "$MEAL_INPUT"
+trap 'rm -f "$TMPJSON" "${TMPJSON%.json}_scaled.json" "$MEAL_INPUT" "$KCAL_FILE" "$ADJUSTED_FILE"' EXIT
 
-docker compose run --rm -T \
+echo ""
+DOCKER_FLAGS="--nutrition-from-file /app/.meal_input.json --date $LOG_DATE --section $MEAL_SECTION"
+[[ "$DEBUG" == "true" ]] && DOCKER_FLAGS="$DOCKER_FLAGS --debug"
+
+docker compose run --rm \
     -e CRONOMETER_USER="$CRONOMETER_USER" \
     -e CRONOMETER_PASSWORD="$CRONOMETER_PASSWORD" \
-    calorie-tracker $DOCKER_FLAGS < "$TMPJSON"
+    calorie-tracker $DOCKER_FLAGS
+
+# ── Adjustment flow (runs on host so claude CLI is available) ─────────────────
+if [[ ! -f "$KCAL_FILE" ]]; then exit 0; fi
+
+TOTAL=$(python3 -c "import json; d=json.load(open('$KCAL_FILE')); print(d['total_cronometer'])")
+echo ""
+read -rp "Adjust? Enter target kcal or press Enter to skip [${TOTAL} kcal logged]: " ADJUST < /dev/tty
+ADJUST="${ADJUST:-}"
+[[ ! "$ADJUST" =~ ^[0-9]+$ ]] && exit 0
+
+echo ""
+echo "Asking Claude for adjustments (${TOTAL} → ${ADJUST} kcal)…"
+
+ING_SUMMARY=$(python3 -c "
+import json
+d = json.load(open('$KCAL_FILE'))
+for i in d['ingredients']:
+    print(f\"  {i['search_name']}: {i['amount_g']}g, logged approx {i['cronometer_kcal']} kcal\")
+")
+
+ADJUSTED_JSON=$(claude -p "You are a registered dietitian. A user tracked a meal in Cronometer.
+Cronometer recorded ${TOTAL} kcal total; the user's target is ${ADJUST} kcal.
+
+Current ingredients (gram amounts and kcal as recorded by Cronometer):
+${ING_SUMMARY}
+
+Adjust gram amounts to hit the target. Scale the highest-calorie items the most.
+Keep each ingredient at least 5g. Recalculate all macros proportionally.
+Reply with ONLY a valid JSON object in this exact format, no explanation:
+{\"meal_name\":\"<name>\",\"ingredients\":[{\"search_name\":\"...\",\"amount_g\":<n>,\"calories\":<n>,\"protein_g\":<n>,\"fat_g\":<n>,\"carbs_g\":<n>,\"fiber_g\":<n>,\"sugar_g\":<n>,\"sodium_mg\":<n>}]}" </dev/null)
+
+echo "$ADJUSTED_JSON" > "$ADJUSTED_FILE"
+
+python3 - "$ADJUSTED_FILE" <<'PYEOF'
+import json, re, sys
+with open(sys.argv[1]) as f:
+    text = f.read().strip()
+if "```" in text:
+    text = re.sub(r"```\w*\n?", "", text).strip()
+d = json.loads(text)
+ings = d["ingredients"]
+total = sum(i["calories"] for i in ings)
+W = 72
+print(f"\n┌{'─'*W}┐")
+print(f"│  {d['meal_name'][:W-2]:<{W-2}}│")
+print(f"├{'─'*34}┬{'─'*7}┬{'─'*7}┬{'─'*7}┬{'─'*7}┬{'─'*6}┤")
+print(f"│  {'Ingredient':<32}│  kcal │  Prot │   Fat │  Carb │    g │")
+print(f"├{'─'*34}┼{'─'*7}┼{'─'*7}┼{'─'*7}┼{'─'*7}┼{'─'*6}┤")
+for i in ings:
+    n = i["search_name"][:31]
+    print(f"│  {n:<31} │{i['calories']:>6} │{i['protein_g']:>6.1f} │{i['fat_g']:>6.1f} │{i['carbs_g']:>6.1f} │{i['amount_g']:>5} │")
+print(f"├{'─'*34}┼{'─'*7}┼{'─'*7}┼{'─'*7}┼{'─'*7}┼{'─'*6}┤")
+print(f"│  {'TOTAL':<31} │{total:>6} │{'':>6} │{'':>6} │{'':>6} │{'':>5} │")
+print(f"└{'─'*34}┴{'─'*7}┴{'─'*7}┴{'─'*7}┴{'─'*7}┴{'─'*6}┘")
+PYEOF
+
+echo ""
+read -rp "Apply these adjustments? This will clear ${MEAL_SECTION} and re-add. [Y/n]: " APPLY < /dev/tty
+APPLY="${APPLY:-y}"
+[[ "$APPLY" =~ ^[Nn] ]] && { echo "Adjustment cancelled."; exit 0; }
+
+echo ""
+echo "Clearing ${MEAL_SECTION}…"
+bash "$SCRIPT_DIR/clear_diary.sh" --date "$LOG_DATE" --section "$MEAL_SECTION"
+
+cp "$ADJUSTED_FILE" "$MEAL_INPUT"
+echo "Re-adding adjusted ingredients…"
+docker compose run --rm \
+    -e CRONOMETER_USER="$CRONOMETER_USER" \
+    -e CRONOMETER_PASSWORD="$CRONOMETER_PASSWORD" \
+    calorie-tracker $DOCKER_FLAGS
