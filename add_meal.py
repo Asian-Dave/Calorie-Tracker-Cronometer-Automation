@@ -122,7 +122,7 @@ async def cronometer_add(
     visible: bool,
     debug: bool = False,
     meal_section: str = "Lunch",
-) -> None:
+) -> tuple[dict, list[float]]:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=not visible,
@@ -151,17 +151,27 @@ async def cronometer_add(
             await shot("2_diary")
 
             ingredients = data["ingredients"]
+            kcal_list: list[float] = []
             for idx, ing in enumerate(ingredients):
                 print(f"\n  [{idx+1}/{len(ingredients)}] {ing['search_name']} ({ing['amount_g']}g, {ing['calories']} kcal)", flush=True)
-                await _add_one_ingredient(page, ing, shot, idx, meal_section=meal_section)
+                kcal = await _add_one_ingredient(page, ing, shot, idx, meal_section=meal_section)
+                kcal_list.append(kcal)
 
             await shot("final")
+            if debug:
+                await _dump_diary_debug(page, BASE_DIR)
+            diary_kcals = await _read_section_kcals(page, meal_section, len(ingredients))
+            _print_logged_summary(data, kcal_list, diary_kcals)
             print(f"\n✓  {len(ingredients)} ingredient(s) added to Cronometer diary!", flush=True)
-            # Clean up any leftover debug files from previous runs
-            for f in BASE_DIR.glob("debug_*.png"):
-                f.unlink(missing_ok=True)
-            for f in BASE_DIR.glob("debug_*.html"):
-                f.unlink(missing_ok=True)
+            # Clean up debug screenshots from this run (only when not in debug mode)
+            if not debug:
+                for f in BASE_DIR.glob("debug_*.png"):
+                    f.unlink(missing_ok=True)
+                for f in BASE_DIR.glob("debug_*.html"):
+                    f.unlink(missing_ok=True)
+
+            # Use actual diary values for the adjustment flow when available
+            return data, diary_kcals if diary_kcals else kcal_list
 
         except Exception as exc:
             # Always save an error screenshot regardless of debug flag
@@ -555,10 +565,11 @@ async def _search_and_pick(page: Page, search_term: str) -> bool:
     return await dialog.locator(f'td:has-text("{keyword}")').count() > 0
 
 
-async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_section: str = "Lunch") -> None:
-    """Add one ingredient: try progressively simpler DB searches, then custom food."""
-    name     = ing["search_name"]
-    target_g = float(ing["amount_g"])
+async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_section: str = "Lunch") -> float:
+    """Add one ingredient; returns kcal actually logged (DB-calibrated when available)."""
+    name      = ing["search_name"]
+    target_g  = float(ing["amount_g"])
+    target_cal = float(ing["calories"])
 
     await _open_food_dialog(page)
     await shot(f"ing{idx}_dialog")
@@ -642,9 +653,9 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
         #     This corrects for caloric-density differences between AI and the DB.
         #  3. If only a named serving with gram weight exists: calculate qty ratio.
         #  4. Fallback: qty = 1.
-        target_cal = float(ing["calories"])
         using_gram_unit = False
         qty_val = "1"
+        kcal_logged = target_cal  # updated below if DB calibration succeeds
 
         # Open the serving dropdown and capture the current button label
         current_serving = await page.evaluate("""() => {
@@ -789,6 +800,7 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
 
                 if db_kcal_100 and db_kcal_100 > 0:
                     final_g = round(target_cal * 100 / db_kcal_100, 1)
+                    kcal_logged = round(db_kcal_100 * final_g / 100, 1)
                     print(f"    Cal: {db_kcal_100} kcal/100g → {final_g}g for {int(target_cal)} kcal", flush=True)
                     qty_val = str(final_g)
                 else:
@@ -822,11 +834,13 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
             await page.wait_for_timeout(500)
 
         print(f"    Added ({found_term!r}).", flush=True)
+        return kcal_logged
 
     else:
         # ── No DB result even with simpler terms → custom food page ──────────
         print(f"    Not in DB — creating custom food.", flush=True)
         await _create_custom_food(page, ing, shot, idx)
+        return target_cal
 
 
 async def _create_custom_food(page: Page, ing: dict, shot, idx: int) -> None:
@@ -907,6 +921,184 @@ async def _create_custom_food(page: Page, ing: dict, shot, idx: int) -> None:
         print(f"    Custom food added, back on diary.", flush=True)
     else:
         print(f"    Custom food added.", flush=True)
+
+
+async def _dump_diary_debug(page: Page, base_dir: Path) -> None:
+    """Save diary HTML + screenshot for DOM debugging."""
+    (base_dir / "debug_diary.html").write_text(await page.content(), encoding="utf-8")
+    await page.screenshot(path=str(base_dir / "debug_diary.png"), full_page=True)
+    print("  [debug] Saved debug_diary.html + debug_diary.png", flush=True)
+
+
+async def _read_section_kcals(page: Page, section: str, expected: int) -> list[float] | None:
+    """Read actual kcal values for each food row in a diary section.
+
+    Retries up to 4× (with 800 ms waits) to handle Cronometer's async diary updates.
+    Returns a list of floats in DOM order, or None if the count never reaches expected.
+    """
+    js = f"""() => {{
+        const ALL_SECTIONS = ['Uncategorized','Breakfast','Lunch','Dinner','Snacks'];
+        const target = {json.dumps(section)};
+        let inSection = false;
+        const kcals = [];
+
+        for (const tr of document.querySelectorAll('tr')) {{
+            if (!tr.offsetParent) continue;
+
+            if (!tr.querySelector('.icon-food')) {{
+                const txt = (tr.innerText || '').trim();
+                for (const s of ALL_SECTIONS) {{
+                    if (txt.startsWith(s)) {{ inSection = s === target; break; }}
+                }}
+                continue;
+            }}
+            if (!inSection) continue;
+
+            // Column layout: name | qty | unit | kcal_value | "kcal" | protein | ...
+            // kcal_value can be integer or decimal ("18.4", "519", "193.2").
+            // The literal cell "kcal" immediately follows the kcal value cell.
+            const cells = Array.from(tr.querySelectorAll('td'))
+                .filter(e => e.offsetParent !== null)
+                .map(e => (e.innerText || '').trim());
+
+            let found = null;
+            for (let i = 1; i < cells.length - 1; i++) {{
+                if (/^kcal$/i.test(cells[i + 1])) {{
+                    const n = parseFloat(cells[i]);
+                    if (!isNaN(n) && n >= 0) {{ found = Math.round(n); break; }}
+                }}
+            }}
+            if (found !== null) kcals.push(found);
+        }}
+        return kcals;
+    }}"""
+
+    for attempt in range(4):
+        result = await page.evaluate(js)
+        if result and len(result) >= expected:
+            return [float(v) for v in result[-expected:]]
+        if attempt < 3:
+            await page.wait_for_timeout(800)
+
+    count = len(result) if result else 0
+    print(f"  (diary read: got {count}/{expected} rows — using AI estimates)", flush=True)
+    return None
+
+
+def _print_logged_summary(
+    data: dict,
+    ai_kcals: list[float],
+    diary_kcals: list[float] | None = None,
+) -> None:
+    ings      = data["ingredients"]
+    ai_total  = sum(i["calories"] for i in ings)
+    has_diary = diary_kcals and len(diary_kcals) == len(ings)
+    log_kcals = diary_kcals if has_diary else ai_kcals
+    log_total = sum(log_kcals)
+    source    = "Cronometer" if has_diary else "AI est"
+    W = 56
+    print(f"\n  {'─'*W}")
+    print(f"  {'Ingredient':<30}  {'AI est':>7}  {source:>10}")
+    print(f"  {'─'*W}")
+    for ing, ai_k, log_k in zip(ings, ai_kcals, log_kcals):
+        diff     = int(log_k) - int(ai_k)
+        diff_str = f"({diff:+d})" if diff != 0 else ""
+        print(f"  {ing['search_name'][:29]:<30}  {int(ai_k):>6} kcal  {int(log_k):>9} kcal  {diff_str}")
+    print(f"  {'─'*W}")
+    diff_total = int(log_total) - int(ai_total)
+    diff_str   = f"({diff_total:+d})" if diff_total != 0 else ""
+    print(f"  {'TOTAL':<30}  {int(ai_total):>6} kcal  {int(log_total):>9} kcal  {diff_str}")
+    print(f"  {'─'*W}")
+
+
+def suggest_adjustments(data: dict, kcal_list: list[float], target_kcal: float) -> dict:
+    """Ask Claude to rescale ingredient amounts to hit target_kcal."""
+    total_logged = sum(kcal_list)
+    ing_lines = "\n".join(
+        f"  {ing['search_name']}: {ing['amount_g']}g, logged≈{kcal:.0f} kcal"
+        for ing, kcal in zip(data["ingredients"], kcal_list)
+    )
+    prompt = (
+        "You are a registered dietitian. A user tracked a meal in Cronometer. "
+        f"Cronometer recorded {total_logged:.0f} kcal total; the user's target is {target_kcal:.0f} kcal.\n\n"
+        f"Current ingredients (gram amounts and kcal as recorded by Cronometer):\n{ing_lines}\n\n"
+        "Adjust gram amounts to hit the target. Scale the highest-calorie items the most. "
+        "Keep each ingredient ≥ 5g. Recalculate all macros proportionally.\n"
+        "Reply with ONLY a valid JSON object in this exact format, no explanation:\n"
+        '{"meal_name":"<name>","ingredients":[{"search_name":"...","amount_g":<n>,"calories":<n>,'
+        '"protein_g":<n>,"fat_g":<n>,"carbs_g":<n>,"fiber_g":<n>,"sugar_g":<n>,"sodium_mg":<n>}]}'
+    )
+    result = subprocess.run(["claude", "-p", prompt], capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(f"Claude CLI failed: {result.stderr.strip()}")
+    text = result.stdout.strip()
+    if "```" in text:
+        text = re.sub(r"```\w*\n?", "", text).strip()
+    return json.loads(text)
+
+
+def _run_adjustment_flow(
+    data: dict,
+    kcal_list: list[float],
+    username: str,
+    password: str,
+    log_date: str,
+    section: str,
+    visible: bool,
+    debug: bool,
+) -> None:
+    total_logged = int(sum(kcal_list))
+    try:
+        ans = input(f"\nAdjust? Enter target kcal or press Enter to skip [{total_logged} kcal logged]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if not ans:
+        return
+    try:
+        target_kcal = float(ans)
+    except ValueError:
+        print("Invalid target — skipping adjustment.", file=sys.stderr)
+        return
+
+    print(f"\nAsking Claude for adjustments ({total_logged} → {int(target_kcal)} kcal)…", flush=True)
+    try:
+        adjusted = suggest_adjustments(data, kcal_list, target_kcal)
+    except Exception as exc:
+        print(f"Could not get suggestions: {exc}", file=sys.stderr)
+        return
+
+    display_breakdown(adjusted)
+
+    try:
+        confirm = input(
+            f"\nApply these adjustments? This will clear {section!r} and re-add. [Y/n]: "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.")
+        return
+    if confirm in ("n", "no"):
+        print("Adjustment cancelled.")
+        return
+
+    print(f"\nClearing {section!r}…", flush=True)
+    try:
+        removed = asyncio.run(cronometer_clear_section(
+            username, password, section=section, log_date=log_date, debug=debug,
+        ))
+        print(f"  Removed {removed} entry/entries.", flush=True)
+    except Exception as exc:
+        print(f"Clear failed: {exc}", file=sys.stderr)
+        return
+
+    print("Re-adding adjusted ingredients…", flush=True)
+    try:
+        asyncio.run(cronometer_add(
+            username, password, adjusted, log_date,
+            visible=visible, debug=debug, meal_section=section,
+        ))
+    except Exception as exc:
+        print(f"Re-add failed: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 async def cronometer_clear_section(
@@ -1132,13 +1324,18 @@ def main() -> None:
         username, password = load_credentials()
         print("Starting Playwright automation…", flush=True)
         try:
-            asyncio.run(cronometer_add(
+            data_out, kcal_list = asyncio.run(cronometer_add(
                 username, password, data, args.date,
                 visible=False, debug=args.debug, meal_section=args.section,
             ))
         except Exception as exc:
             print(f"\nAutomation failed: {exc}", file=sys.stderr, flush=True)
             sys.exit(1)
+        if sys.stdout.isatty():
+            _run_adjustment_flow(
+                data_out, kcal_list, username, password,
+                args.date, args.section, False, args.debug,
+            )
         return
 
     # ── Local mode: run Claude + Playwright directly on host ──────────────────
@@ -1184,12 +1381,16 @@ def main() -> None:
 
     username, password = load_credentials()
     try:
-        asyncio.run(cronometer_add(
-        username, password, data, args.date,
-        visible=args.visible, debug=args.debug, meal_section=args.section,
-    ))
+        data_out, kcal_list = asyncio.run(cronometer_add(
+            username, password, data, args.date,
+            visible=args.visible, debug=args.debug, meal_section=args.section,
+        ))
     except Exception:
         sys.exit(1)
+    _run_adjustment_flow(
+        data_out, kcal_list, username, password,
+        args.date, args.section, args.visible, args.debug,
+    )
 
 
 if __name__ == "__main__":
