@@ -86,14 +86,14 @@ LOG_DATE_OFFSET=$(_cfg date_offset 0)
 LOG_DATE=$(date -v+"${LOG_DATE_OFFSET}d" +%Y-%m-%d 2>/dev/null || date -d "+${LOG_DATE_OFFSET} days" +%Y-%m-%d)
 ESTIMATE_ONLY=false
 DEBUG=false
-MEAL=$(_cfg meal "Lunch")
+MEAL_SECTION=$(_cfg meal "Lunch")
 PORTION=$(_cfg portion "normal")
 
 # ── Argument parsing — flags override config defaults ─────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --date)          LOG_DATE="$2"; shift 2 ;;
-        --meal)          MEAL="$2"; shift 2 ;;
+        --meal)          MEAL_SECTION="$2"; shift 2 ;;
         --portion)       PORTION="$2"; shift 2 ;;
         --estimate-only) ESTIMATE_ONLY=true; shift ;;
         --debug)         DEBUG=true; shift ;;
@@ -103,31 +103,32 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "Using defaults → meal: $MEAL | portion: $PORTION | date: $LOG_DATE"
+echo "Using defaults → meal: $MEAL_SECTION | portion: $PORTION | date: $LOG_DATE"
 
-MEAL="${*:-}"
+FOOD_DESCRIPTION="${*:-}"
 
 # ── Interactive input if no meal given ────────────────────────────────────────
-if [[ -z "$MEAL" ]]; then
+if [[ -z "$FOOD_DESCRIPTION" ]]; then
     echo "Paste the meal description (press Enter twice when done):"
     lines=()
     while IFS= read -r line; do
         [[ -z "$line" ]] && (( ${#lines[@]} > 0 )) && break
         lines+=("$line")
     done
-    MEAL=$(printf '%s\n' "${lines[@]}")
+    FOOD_DESCRIPTION=$(printf '%s\n' "${lines[@]}")
 fi
 
-if [[ -z "$MEAL" ]]; then
+if [[ -z "$FOOD_DESCRIPTION" ]]; then
     echo "Error: no meal description provided." >&2
     exit 1
 fi
 
 # ── Estimate nutrition via Claude Code on the host ────────────────────────────
 echo ""
-echo "Estimating nutrition for: ${MEAL:0:80}..."
+echo "Estimating nutrition for: ${FOOD_DESCRIPTION:0:80}..."
 
-TMPJSON=$(mktemp /tmp/meal_nutrition_XXXXXX.json)
+TMPJSON="/tmp/meal_nutrition_$$.json"
+rm -f "$TMPJSON"
 trap 'rm -f "$TMPJSON"' EXIT
 
 PORTION_NOTE="Portion size: normal (standard canteen serving)."
@@ -142,10 +143,10 @@ Break this meal into individual components for Cronometer food diary tracking.
 Use English ingredient names that Cronometer's USDA/NCCDB food database would recognise — prefer generic names (e.g. 'hamburger bun white' over brand names).
 ${PORTION_NOTE}
 
-Meal: ${MEAL}
+Meal: ${FOOD_DESCRIPTION}
 
 Reply with ONLY a valid JSON object, no markdown, no explanation:
-{\"meal_name\":\"<short name>\",\"ingredients\":[{\"search_name\":\"<English name for Cronometer search, 2-4 words, generic>\",\"amount_g\":<number>,\"calories\":<integer>,\"protein_g\":<number>,\"fat_g\":<number>,\"carbs_g\":<number>,\"fiber_g\":<number>,\"sugar_g\":<number>,\"sodium_mg\":<number>}]}" > "$TMPJSON"
+{\"meal_name\":\"<short name>\",\"ingredients\":[{\"search_name\":\"<English name for Cronometer search, 2-4 words, generic>\",\"amount_g\":<number>,\"calories\":<integer>,\"protein_g\":<number>,\"fat_g\":<number>,\"carbs_g\":<number>,\"fiber_g\":<number>,\"sugar_g\":<number>,\"sodium_mg\":<number>}]}" </dev/null > "$TMPJSON"
 
 # ── Display ingredient table ───────────────────────────────────────────────────
 python3 - "$TMPJSON" <<'PYEOF'
@@ -173,19 +174,145 @@ PYEOF
 
 [[ "$ESTIMATE_ONLY" == "true" ]] && exit 0
 
-# ── Confirm ────────────────────────────────────────────────────────────────────
-read -rp $"\nLog this to Cronometer for ${LOG_DATE}? [Y/n]: " CONFIRM
+# ── Confirm (or scale) ─────────────────────────────────────────────────────────
+TOTAL_CALS=$(python3 -c "import json; d=json.load(open('$TMPJSON')); print(sum(int(i['calories']) for i in d['ingredients']))")
+echo ""
+read -rp "Log this (${TOTAL_CALS} kcal) to Cronometer for ${LOG_DATE}? [Y/n/<target kcal>]: " CONFIRM < /dev/tty
 CONFIRM="${CONFIRM:-y}"
 [[ "$CONFIRM" =~ ^[Nn] ]] && { echo "Aborted."; exit 0; }
 
-# ── Hand off to Docker for Playwright automation ───────────────────────────────
-# -T disables TTY allocation (piping stdin); the container reads the JSON and
-# runs Playwright headlessly — no interaction needed at this point.
-echo ""
-DOCKER_FLAGS="--nutrition-from-stdin --date $LOG_DATE --meal $MEAL"
-[[ "$DEBUG"   == "true" ]] && DOCKER_FLAGS="$DOCKER_FLAGS --debug"
+# ── Optional calorie scaling ───────────────────────────────────────────────────
+# If the user typed a number, scale all ingredient amounts proportionally to
+# reach that calorie target (useful when the AI estimate feels too low/high).
+if [[ "$CONFIRM" =~ ^[0-9]+$ ]]; then
+    TMPJSON_SCALED="${TMPJSON%.json}_scaled.json"
+    trap 'rm -f "$TMPJSON" "$TMPJSON_SCALED"' EXIT
+    python3 -c "
+import json, sys
+target = int(sys.argv[1])
+with open(sys.argv[2]) as f:
+    d = json.load(f)
+total = sum(i['calories'] for i in d['ingredients'])
+if total > 0:
+    s = target / total
+    for i in d['ingredients']:
+        i['amount_g']   = round(i['amount_g']   * s, 1)
+        i['calories']   = round(i['calories']    * s)
+        i['protein_g']  = round(i['protein_g']   * s, 1)
+        i['fat_g']      = round(i['fat_g']        * s, 1)
+        i['carbs_g']    = round(i['carbs_g']      * s, 1)
+        i['fiber_g']    = round(i['fiber_g']      * s, 1)
+        i['sugar_g']    = round(i['sugar_g']      * s, 1)
+        i['sodium_mg']  = round(i['sodium_mg']    * s)
+with open(sys.argv[3], 'w') as f:
+    json.dump(d, f)
+" "$CONFIRM" "$TMPJSON" "$TMPJSON_SCALED"
+    echo "  Scaled: ${TOTAL_CALS} → ${CONFIRM} kcal (factor $(python3 -c "print(f'{$CONFIRM/$TOTAL_CALS:.2f}')") )"
+    TMPJSON="$TMPJSON_SCALED"
+fi
 
-docker compose run --rm -T \
+# ── Hand off to Docker for Playwright automation ───────────────────────────────
+MEAL_INPUT="$SCRIPT_DIR/.meal_input.json"
+KCAL_FILE="$SCRIPT_DIR/.last_logged_kcals.json"
+ADJUSTED_FILE="$SCRIPT_DIR/.adjusted_meal.json"
+cp "$TMPJSON" "$MEAL_INPUT"
+trap 'rm -f "$TMPJSON" "${TMPJSON%.json}_scaled.json" "$MEAL_INPUT" "$KCAL_FILE" "$ADJUSTED_FILE"' EXIT
+
+echo ""
+DOCKER_FLAGS="--nutrition-from-file /app/.meal_input.json --date $LOG_DATE --section $MEAL_SECTION"
+[[ "$DEBUG" == "true" ]] && DOCKER_FLAGS="$DOCKER_FLAGS --debug"
+
+docker compose run --rm \
     -e CRONOMETER_USER="$CRONOMETER_USER" \
     -e CRONOMETER_PASSWORD="$CRONOMETER_PASSWORD" \
-    calorie-tracker $DOCKER_FLAGS < "$TMPJSON"
+    calorie-tracker $DOCKER_FLAGS
+
+# ── Adjustment loop (runs on host so claude CLI is available) ─────────────────
+if [[ ! -f "$KCAL_FILE" ]]; then exit 0; fi
+
+_read_kcal_file() {
+    TOTAL=$(python3 -c "import json; d=json.load(open('$KCAL_FILE')); print(d['total_cronometer'])")
+    ITEMS_BEFORE=$(python3 -c "import json; d=json.load(open('$KCAL_FILE')); print(d['items_before'])")
+    ITEMS_ADDED=$(python3 -c "import json; d=json.load(open('$KCAL_FILE')); print(len(d['ingredients']))")
+}
+
+_read_kcal_file
+
+while true; do
+    echo ""
+    read -rp "Adjust? Enter target kcal or press Enter to finish [${TOTAL} kcal logged]: " ADJUST < /dev/tty
+    ADJUST="${ADJUST:-}"
+    [[ ! "$ADJUST" =~ ^[0-9]+$ ]] && { echo "Done."; break; }
+
+    echo ""
+    echo "Asking Claude for adjustments (${TOTAL} → ${ADJUST} kcal)…"
+
+    ING_SUMMARY=$(python3 -c "
+import json
+d = json.load(open('$KCAL_FILE'))
+for i in d['ingredients']:
+    print(f\"  {i['search_name']}: {i['amount_g']}g, logged approx {i['cronometer_kcal']} kcal\")
+")
+
+    ADJUSTED_JSON=$(claude -p "You are a registered dietitian. A user tracked a meal in Cronometer.
+Cronometer recorded ${TOTAL} kcal total; the user's target is ${ADJUST} kcal.
+
+Current ingredients (gram amounts and kcal as recorded by Cronometer):
+${ING_SUMMARY}
+
+Adjust gram amounts to hit the target. Scale the highest-calorie items the most.
+Keep each ingredient at least 5g. Recalculate all macros proportionally.
+Reply with ONLY a valid JSON object in this exact format, no explanation:
+{\"meal_name\":\"<name>\",\"ingredients\":[{\"search_name\":\"...\",\"amount_g\":<n>,\"calories\":<n>,\"protein_g\":<n>,\"fat_g\":<n>,\"carbs_g\":<n>,\"fiber_g\":<n>,\"sugar_g\":<n>,\"sodium_mg\":<n>}]}" </dev/null)
+
+    echo "$ADJUSTED_JSON" > "$ADJUSTED_FILE"
+
+    python3 - "$ADJUSTED_FILE" <<'PYEOF'
+import json, re, sys
+with open(sys.argv[1]) as f:
+    text = f.read().strip()
+if "```" in text:
+    text = re.sub(r"```\w*\n?", "", text).strip()
+d = json.loads(text)
+ings = d["ingredients"]
+total = sum(i["calories"] for i in ings)
+W = 72
+print(f"\n┌{'─'*W}┐")
+print(f"│  {d['meal_name'][:W-2]:<{W-2}}│")
+print(f"├{'─'*34}┬{'─'*7}┬{'─'*7}┬{'─'*7}┬{'─'*7}┬{'─'*6}┤")
+print(f"│  {'Ingredient':<32}│  kcal │  Prot │   Fat │  Carb │    g │")
+print(f"├{'─'*34}┼{'─'*7}┼{'─'*7}┼{'─'*7}┼{'─'*7}┼{'─'*6}┤")
+for i in ings:
+    n = i["search_name"][:31]
+    print(f"│  {n:<31} │{i['calories']:>6} │{i['protein_g']:>6.1f} │{i['fat_g']:>6.1f} │{i['carbs_g']:>6.1f} │{i['amount_g']:>5} │")
+print(f"├{'─'*34}┼{'─'*7}┼{'─'*7}┼{'─'*7}┼{'─'*7}┼{'─'*6}┤")
+print(f"│  {'TOTAL':<31} │{total:>6} │{'':>6} │{'':>6} │{'':>6} │{'':>5} │")
+print(f"└{'─'*34}┴{'─'*7}┴{'─'*7}┴{'─'*7}┴{'─'*7}┴{'─'*6}┘")
+PYEOF
+
+    echo ""
+    read -rp "Apply these adjustments? This will replace the ${ITEMS_ADDED} items we added. [Y/n]: " APPLY < /dev/tty
+    APPLY="${APPLY:-y}"
+    if [[ "$APPLY" =~ ^[Nn] ]]; then
+        echo "Adjustment cancelled. Keeping current entries."
+        continue
+    fi
+
+    echo ""
+    echo "Clearing the ${ITEMS_ADDED} items we added to ${MEAL_SECTION}…"
+    bash "$SCRIPT_DIR/clear_diary.sh" --date "$LOG_DATE" --section "$MEAL_SECTION" \
+        --skip-first "$ITEMS_BEFORE" --delete-count "$ITEMS_ADDED"
+
+    cp "$ADJUSTED_FILE" "$MEAL_INPUT"
+    echo "Re-adding adjusted ingredients…"
+    docker compose run --rm \
+        -e CRONOMETER_USER="$CRONOMETER_USER" \
+        -e CRONOMETER_PASSWORD="$CRONOMETER_PASSWORD" \
+        calorie-tracker $DOCKER_FLAGS
+
+    if [[ ! -f "$KCAL_FILE" ]]; then
+        echo "Warning: no kcal file written after re-add; exiting loop."
+        break
+    fi
+    _read_kcal_file
+done
