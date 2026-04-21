@@ -162,7 +162,16 @@ async def cronometer_add(
             if debug:
                 await _dump_diary_debug(page, BASE_DIR)
             diary_kcals = await _read_section_kcals(page, meal_section, len(ingredients))
-            _print_logged_summary(data, kcal_list, diary_kcals)
+
+            # When individual row reads fail, read the section total from the
+            # header row — it's always accurate and triggers the correct adjust prompt.
+            section_total: int | None = None
+            if diary_kcals is None:
+                section_total = await _read_section_total(page, meal_section)
+                if section_total is not None:
+                    print(f"  (section total from header: {section_total} kcal)", flush=True)
+
+            _print_logged_summary(data, kcal_list, diary_kcals, section_total)
             print(f"\n✓  {len(ingredients)} ingredient(s) added to Cronometer diary!", flush=True)
             # Clean up debug screenshots from this run (only when not in debug mode)
             if not debug:
@@ -171,8 +180,18 @@ async def cronometer_add(
                 for f in BASE_DIR.glob("debug_*.html"):
                     f.unlink(missing_ok=True)
 
-            # Use actual diary values for the adjustment flow when available
-            return data, diary_kcals if diary_kcals else kcal_list, items_before
+            # Use actual diary values for the adjustment flow when available.
+            # If individual rows failed but section total was read, scale kcal_list
+            # proportionally so total_cronometer in the kcal file reflects reality.
+            if diary_kcals is not None:
+                effective_kcals = diary_kcals
+            elif section_total is not None:
+                ai_total = sum(i["calories"] for i in ingredients)
+                scale = section_total / ai_total if ai_total > 0 else 1.0
+                effective_kcals = [round(k * scale, 1) for k in kcal_list]
+            else:
+                effective_kcals = kcal_list
+            return data, effective_kcals, items_before
 
         except Exception as exc:
             # Always save an error screenshot regardless of debug flag
@@ -548,21 +567,19 @@ def _search_fallbacks(name: str) -> list[str]:
 
 async def _search_and_pick(page: Page, search_term: str) -> bool:
     """Search for search_term, return True if results appeared."""
-    await page.evaluate(f"""() => {{
-        const inputs = Array.from(document.querySelectorAll('input[placeholder="Search all foods & recipes..."]'))
-            .filter(e => e.offsetParent !== null);
-        if (inputs[0]) {{
-            inputs[0].value = {json.dumps(search_term)};
-            inputs[0].dispatchEvent(new Event('input', {{bubbles:true}}));
-        }}
-    }}""")
-    await page.evaluate("() => document.querySelector('button.food-search-btn')?.click()")
-    await page.wait_for_timeout(2_500)
-    keyword = search_term.split()[0]
-    # Scope to the search dialog so diary entries don't produce false positives
+    # Use Playwright's fill + Enter so real keyboard events reach GWT's search handler.
+    # The previous JS-based approach relied on button.food-search-btn which can silently
+    # fail (wrong class / not in scope), leaving stale results from the prior ingredient.
     dialog = page.locator(
         '.pretty-dialog:has(input[placeholder="Search all foods & recipes..."])'
     ).first
+    search_input = dialog.locator('input[placeholder="Search all foods & recipes..."]').first
+    await search_input.click(force=True)
+    await search_input.fill(search_term)
+    await search_input.press("Enter")
+    await page.wait_for_timeout(2_500)
+    keyword = search_term.split()[0]
+    # Scope to the search dialog so diary entries don't produce false positives
     return await dialog.locator(f'td:has-text("{keyword}")').count() > 0
 
 
@@ -655,6 +672,7 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
         #  3. If only a named serving with gram weight exists: calculate qty ratio.
         #  4. Fallback: qty = 1.
         using_gram_unit = False
+        no_gram_option = False
         qty_val = "1"
         kcal_logged = target_cal  # updated below if DB calibration succeeds
 
@@ -706,7 +724,8 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
             else:
                 # No gram option — select the first available unit (do NOT press Escape,
                 # which would close the entire food dialog, not just the dropdown).
-                # Then estimate qty from the serving label's weight (g or ml).
+                # qty will be determined via calorie calibration below.
+                no_gram_option = True
                 if dropdown_items:
                     try:
                         first_item = page.locator('.dropdown-item').filter(
@@ -714,25 +733,17 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
                         ).first
                         await first_item.click(force=True, timeout=3_000)
                         await page.wait_for_timeout(500)
-                        serving_label = dropdown_items[0]
+                        print(f"    No gram unit, selected {dropdown_items[0]!r} — will calibrate", flush=True)
                     except PWTimeout:
                         await page.keyboard.press("Escape")
                         await page.wait_for_timeout(300)
-                        serving_label = current_serving
+                        no_gram_option = False  # dropdown failed; keep qty_val="1"
+                        print(f"    No gram unit, dropdown click failed — using qty=1", flush=True)
                 else:
                     await page.keyboard.press("Escape")
                     await page.wait_for_timeout(300)
-                    serving_label = current_serving
-
-                # Try to parse gram weight from label: prefer explicit 'g', then treat ml as g
-                gm = re.search(r"(\d+(?:\.\d+)?)\s*g\b", serving_label)
-                if gm:
-                    qty_val = f"{target_g / float(gm.group(1)):.2f}"
-                else:
-                    ml = re.search(r"(\d+(?:\.\d+)?)\s*ml\b", serving_label, re.IGNORECASE)
-                    if ml:
-                        qty_val = f"{target_g / float(ml.group(1)):.2f}"
-                print(f"    No gram unit (options: {dropdown_items[:4]}), qty={qty_val}", flush=True)
+                    no_gram_option = False
+                    print(f"    No gram unit and no dropdown items — using qty=1", flush=True)
         else:
             print(f"    Serving dropdown not found", flush=True)
 
@@ -758,7 +769,7 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
                 await qty_loc.click(click_count=3, force=True)
                 await qty_loc.press_sequentially("100", delay=40)
                 await qty_loc.press("Tab")
-                await page.wait_for_timeout(700)
+                await page.wait_for_timeout(1200)
 
                 db_kcal_100 = await page.evaluate("""() => {
                     // Scope ENTIRELY to the food search dialog so we never read
@@ -770,15 +781,19 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
 
                     // Strategy 1: find an element whose ENTIRE visible text is
                     // "NNN kcal" — the food detail panel's standalone kcal display.
+                    // Collect ALL candidates and return the LARGEST to avoid picking
+                    // up small micro-nutrient or placeholder values.
+                    const candidates = [];
                     for (const el of dialog.querySelectorAll('div,span,td,label,p')) {
                         if (!el.offsetParent) continue;
                         const text = (el.innerText || '').trim();
                         const m = text.match(/^([0-9]{1,4})\\s*kcal$/i);
                         if (m) {
                             const n = parseInt(m[1]);
-                            if (n > 0 && n < 5000) return n;
+                            if (n > 0 && n < 5000) candidates.push(n);
                         }
                     }
+                    if (candidates.length > 0) return Math.max(...candidates);
 
                     // Strategy 2: walk up from "Add to Diary" but stop at the
                     // dialog boundary so we can never escape into the diary.
@@ -801,12 +816,70 @@ async def _add_one_ingredient(page: Page, ing: dict, shot, idx: int, meal_sectio
 
                 if db_kcal_100 and db_kcal_100 > 0:
                     final_g = round(target_cal * 100 / db_kcal_100, 1)
-                    kcal_logged = round(db_kcal_100 * final_g / 100, 1)
-                    print(f"    Cal: {db_kcal_100} kcal/100g → {final_g}g for {int(target_cal)} kcal", flush=True)
-                    qty_val = str(final_g)
+                    # Sanity check: if the calibrated amount is wildly off from the
+                    # AI gram estimate, the kcal read was probably stale or wrong.
+                    # Legitimate cooked/dry density differences stay within ~3x.
+                    ratio = final_g / target_g if target_g > 0 else 99
+                    if ratio > 3.0 or ratio < 0.1:
+                        print(f"    Cal: read {db_kcal_100} kcal/100g → {final_g}g (ratio {ratio:.1f}x vs AI {target_g}g — suspicious, using AI estimate)", flush=True)
+                        qty_val = str(target_g)
+                    else:
+                        kcal_logged = round(db_kcal_100 * final_g / 100, 1)
+                        print(f"    Cal: {db_kcal_100} kcal/100g → {final_g}g for {int(target_cal)} kcal", flush=True)
+                        qty_val = str(final_g)
                 else:
                     print(f"    Cal: density read failed, using AI estimate {target_g}g", flush=True)
                     qty_val = str(target_g)
+
+            elif no_gram_option and target_cal > 0:
+                # Non-gram unit (e.g. tbsp, tsp, cup) with no parseable gram weight.
+                # Calibrate: enter 10 units as reference, read Cronometer's displayed kcal,
+                # then compute how many units are needed to hit target_cal.
+                await qty_loc.click(click_count=3, force=True)
+                await qty_loc.press_sequentially("10", delay=40)
+                await qty_loc.press("Tab")
+                await page.wait_for_timeout(700)
+
+                kcal_for_10 = await page.evaluate("""() => {
+                    const dialog = document.querySelector(
+                        '.pretty-dialog:has(input[placeholder="Search all foods & recipes..."])'
+                    );
+                    if (!dialog) return null;
+                    for (const el of dialog.querySelectorAll('div,span,td,label,p')) {
+                        if (!el.offsetParent) continue;
+                        const text = (el.innerText || '').trim();
+                        const m = text.match(/^([0-9]{1,4})\\s*kcal$/i);
+                        if (m) {
+                            const n = parseInt(m[1]);
+                            if (n > 0 && n < 5000) return n;
+                        }
+                    }
+                    const addBtn = Array.from(dialog.querySelectorAll('button'))
+                        .find(b => b.offsetParent !== null
+                                && /add to diary/i.test(b.innerText?.trim()));
+                    let el = addBtn?.parentElement;
+                    for (let i = 0; i < 6 && el && dialog.contains(el); i++) {
+                        const t = el.innerText || '';
+                        const m = t.match(/([0-9]{1,4})\\s*kcal/i)
+                               || t.match(/kcal\\s*([0-9]{1,4})/i);
+                        if (m) {
+                            const n = parseInt(m[1]);
+                            if (n > 0 && n < 5000) return n;
+                        }
+                        el = el.parentElement;
+                    }
+                    return null;
+                }""")
+
+                if kcal_for_10 and kcal_for_10 > 0:
+                    kcal_per_unit = kcal_for_10 / 10.0
+                    needed_qty = round(target_cal / kcal_per_unit, 2)
+                    kcal_logged = round(target_cal)
+                    print(f"    Cal: {kcal_per_unit:.1f} kcal/unit → {needed_qty} units for {int(target_cal)} kcal", flush=True)
+                    qty_val = str(needed_qty)
+                else:
+                    print(f"    Cal: unit calibration failed, using qty=1", flush=True)
+                    qty_val = "1"
 
             # Enter the final quantity
             await qty_loc.click(click_count=3, force=True)
@@ -1003,7 +1076,37 @@ async def _read_section_kcals(page: Page, section: str, expected: int) -> list[f
             await page.wait_for_timeout(800)
 
     count = len(result) if result else 0
-    print(f"  (diary read: got {count}/{expected} rows — using AI estimates)", flush=True)
+    print(f"  (diary read: got {count}/{expected} rows — falling back to section total)", flush=True)
+    return None
+
+
+async def _read_section_total(page: Page, section: str) -> int | None:
+    """Read the kcal total shown in the diary section header row.
+
+    Much more reliable than parsing individual food rows — Cronometer always
+    shows a running sum in the section header, updated after every add.
+    Returns None if the header row cannot be found or parsed.
+    """
+    js = f"""() => {{
+        const ALL_SECTIONS = ['Uncategorized','Breakfast','Lunch','Dinner','Snacks'];
+        const target = {json.dumps(section)};
+        for (const tr of document.querySelectorAll('tr')) {{
+            if (!tr.offsetParent) continue;
+            if (tr.querySelector('.icon-food')) continue;
+            const txt = (tr.innerText || '').trim();
+            if (!txt.startsWith(target)) continue;
+            // Section header contains "Lunch  ●  720 kcal" or similar
+            const m = txt.match(/([0-9]+(?:\\.[0-9]+)?)\\s*kcal/i);
+            if (m) return Math.round(parseFloat(m[1]));
+        }}
+        return null;
+    }}"""
+    for attempt in range(3):
+        result = await page.evaluate(js)
+        if result and result > 0:
+            return result
+        if attempt < 2:
+            await page.wait_for_timeout(800)
     return None
 
 
@@ -1011,12 +1114,13 @@ def _print_logged_summary(
     data: dict,
     ai_kcals: list[float],
     diary_kcals: list[float] | None = None,
+    section_total: int | None = None,
 ) -> None:
     ings      = data["ingredients"]
     ai_total  = sum(i["calories"] for i in ings)
     has_diary = diary_kcals and len(diary_kcals) == len(ings)
     log_kcals = diary_kcals if has_diary else ai_kcals
-    log_total = sum(log_kcals)
+    log_total = section_total if (section_total and not has_diary) else sum(log_kcals)
     source    = "Cronometer" if has_diary else "AI est"
     W = 56
     print(f"\n  {'─'*W}")
@@ -1029,7 +1133,8 @@ def _print_logged_summary(
     print(f"  {'─'*W}")
     diff_total = int(log_total) - int(ai_total)
     diff_str   = f"({diff_total:+d})" if diff_total != 0 else ""
-    print(f"  {'TOTAL':<30}  {int(ai_total):>6} kcal  {int(log_total):>9} kcal  {diff_str}")
+    crn_label  = "Cronometer" if (has_diary or section_total) else "AI est"
+    print(f"  {'TOTAL':<30}  {int(ai_total):>6} kcal  {int(log_total):>9} kcal  {diff_str}  ← {crn_label}")
     print(f"  {'─'*W}")
 
 

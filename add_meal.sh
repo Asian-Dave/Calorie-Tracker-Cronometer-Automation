@@ -267,6 +267,17 @@ Reply with ONLY a valid JSON object in this exact format, no explanation:
 
     echo "$ADJUSTED_JSON" > "$ADJUSTED_FILE"
 
+    if ! python3 -c "
+import json, re, sys
+text = open(sys.argv[1]).read().strip()
+if '\`\`\`' in text:
+    text = re.sub(r'\`\`\`\w*\n?', '', text).strip()
+json.loads(text)
+" "$ADJUSTED_FILE" 2>/dev/null; then
+        echo "Claude returned invalid JSON — skipping this adjustment. Try again."
+        continue
+    fi
+
     python3 - "$ADJUSTED_FILE" <<'PYEOF'
 import json, re, sys
 with open(sys.argv[1]) as f:
