@@ -126,7 +126,27 @@ Using defaults → meal: Lunch | portion: generous | date: 2026-04-16
 Log these 5 ingredients to Cronometer for 2026-04-16? [Y/n]:
 ```
 
-Confirm and the browser automation runs silently in the background.
+Confirm, and the browser automation runs silently in the background. Once all ingredients are logged, the tool prints a comparison of the AI-estimated calories against the values Cronometer actually recorded:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│  Chicken Burger Deluxe with Herb Fries  —  Cronometer summary          │
+├──────────────────────────────────┬───────────┬───────────┬─────────────┤
+│  Ingredient                      │  AI kcal  │  CRN kcal │    diff     │
+├──────────────────────────────────┼───────────┼───────────┼─────────────┤
+│  Hamburger bun white             │       220 │       214 │      -6     │
+│  Breaded chicken fillet fried    │       295 │       301 │      +6     │
+│  Ranch dressing                  │       130 │       118 │     -12     │
+│  Romaine lettuce                 │         3 │         3 │       0     │
+│  French fries                    │       430 │       441 │     +11     │
+├──────────────────────────────────┼───────────┼───────────┼─────────────┤
+│  TOTAL                           │      1078 │      1077 │      -1     │
+└──────────────────────────────────┴───────────┴───────────┴─────────────┘
+
+Adjust? Enter target kcal or press Enter to finish [1077 kcal logged]:
+```
+
+You can then enter a target calorie count. Claude will rescale gram amounts to hit that target, show a preview, and ask for confirmation before clearing and re-adding only the items this session logged (pre-existing entries in the same section are left untouched). The prompt loops until you press Enter without a number.
 
 ## Configuration
 
@@ -172,12 +192,31 @@ All flags override the corresponding `config.json` default.
 ./add_meal.sh --debug "your meal"
 ```
 
+### Clearing diary entries
+
+`clear_diary.sh` removes entries from a diary section without adding anything new. Useful for correcting mistakes manually.
+
+```bash
+# Clear all Lunch entries for today
+./clear_diary.sh
+
+# Clear a specific section or date
+./clear_diary.sh --section Dinner
+./clear_diary.sh --date 2026-04-20 --section Lunch
+
+# Clear only a slice of entries (skip the first N, then delete at most M)
+./clear_diary.sh --skip-first 2 --delete-count 3
+```
+
+The `--skip-first` / `--delete-count` flags are also what the adjustment loop uses internally to replace only the items it added, leaving any pre-existing entries in the section untouched.
+
 ## Project structure
 
 ```
 calorie-tracker/
 ├── add_meal.sh          # Entry point — run this daily
 ├── add_meal.py          # Playwright browser automation (runs inside Docker)
+├── clear_diary.sh       # Utility to remove entries from a diary section
 ├── setup.sh             # One-time credential setup (keychain / .env)
 ├── config.json          # Your personal defaults (git-ignored)
 ├── config.json.example  # Template showing the expected format
